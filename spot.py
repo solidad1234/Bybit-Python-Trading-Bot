@@ -14,7 +14,8 @@ api_secret = ""
 symbol = "SOLUSDT"
 timeframe = "15"  # 15-minute candles 
 rsi_period = 14
-qty = 10
+qty = 0.045
+
 
 session = HTTP(
     testnet=False,  # False for the live environment
@@ -64,6 +65,7 @@ def place_order(side, qty, price=None, order_type="MARKET", time_in_force="GTC")
         "orderType": order_type.capitalize(),  # e.g., "Market" or "Limit"
         "qty": str(qty),
         "timeInForce": time_in_force,
+        "marketUnit": "basecoin"
     }
 
     # Add price for limit orders
@@ -98,13 +100,15 @@ def trade_with_rsi():
     
     print(f"Current RSI: {latest_rsi:.2f} at : {current_time}") 
 
-    if latest_rsi < 40:
+    if latest_rsi < 45:
         place_order("buy", qty)
-    elif latest_rsi > 60:
+    elif latest_rsi > 65:
         place_order("sell", qty)
 
 #combining all RSI, MA, EMA and MACD
-def combined_trade_signal(symbol, closing_prices, qty):
+def combined_trade_signal():
+    closing_prices = fetch_candle_data(symbol, timeframe)
+    
     # Calculate the indicators using TA-Lib
     rsi = talib.RSI(closing_prices, timeperiod=14)
     macd, signal, hist = talib.MACD(closing_prices, fastperiod=12, slowperiod=26, signalperiod=9)
@@ -141,7 +145,9 @@ def combined_trade_signal(symbol, closing_prices, qty):
     else:
         print("No Clear Signal") 
 
+
 while True:
     print(f"Trading {symbol}")
+    # combined_trade_signal()
     trade_with_rsi()
     time.sleep(900)  # Check every 15 minutes
