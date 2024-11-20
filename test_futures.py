@@ -140,17 +140,23 @@ def analyze_and_trade():
     print(f"Latest Price: {latest_price}, RSI: {latest_rsi:.2f}, EMA: {latest_ema:.2f}, MACD: {latest_macd:.2f}, Signal: {latest_signal:.2f}")
     
     # Trading logic
-    if latest_rsi < 45 and latest_macd > latest_signal and latest_price > latest_ema:
+    if latest_rsi < 30 and latest_macd > latest_signal and closing_prices[-1] > latest_ema:
         print("Buy signal detected.")
         stop_loss = latest_price * 0.98  # Example: 2% below current price
         take_profit = latest_price * 1.05  # Example: 5% above current price
         place_order_with_risk_management("buy", QTY, stop_loss, take_profit)
 
-    elif latest_rsi > 60 and latest_macd < latest_signal and latest_price < latest_ema:
+    elif latest_rsi > 70 and latest_macd < latest_signal and closing_prices[-1] < latest_ema:
         print("Sell signal detected.")
         stop_loss = latest_price * 1.02  # Example: 2% above current price
         take_profit = latest_price * 0.95  # Example: 5% below current price
         place_order_with_risk_management("sell", QTY, stop_loss, take_profit)
+
+    elif closing_prices[-1] < latest_ema and closing_prices[-1] < latest_sma:
+        print("Buy signal detected.")
+        stop_loss = latest_price * 0.98  # Example: 2% below current price
+        take_profit = latest_price * 1.05  # Example: 5% above current price
+        place_order_with_risk_management("buy", QTY, stop_loss, take_profit)
 
     else:
         print("No clear trading signal.\n")
