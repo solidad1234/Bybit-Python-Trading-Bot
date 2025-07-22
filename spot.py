@@ -6,10 +6,17 @@ import talib
 import numpy as np
 from datetime import datetime, timedelta
 from pybit.unified_trading import HTTP
+from dotenv import load_dotenv
+import os
 
-# API keys
-api_key = input("Enter you api key: ")
-api_secret = input("Enter your api secret: ")
+load_dotenv()
+api_key = os.getenv("API_KEY")
+api_secret = os.getenv("API_SECRET")
+
+
+# # API keys
+# api_key = input("Enter you api key: ")
+# api_secret = input("Enter your api secret: ")
 
 symbol = "SOLUSDT"
 primary_timeframe = "15"   # Primary analysis
