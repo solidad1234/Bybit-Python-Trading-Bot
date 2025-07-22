@@ -41,6 +41,37 @@ trading_state = {
     'winning_trades': 0
 }
 
+def get_sol_balance():
+    """Get SOL balance for selling"""
+    account_types = ["UNIFIED", "SPOT"]
+    
+    for account_type in account_types:
+        try:
+            result = session.get_wallet_balance(accountType=account_type)
+            if result.get("retCode") == 0:
+                account_list = result.get("result", {}).get("list", [])
+                if account_list:
+                    coins = account_list[0].get("coin", [])
+                    for coin in coins:
+                        if coin["coin"] == "SOL":
+                            balance_str = coin.get("availableToWithdraw", "0")
+                            wallet_balance = coin.get("walletBalance", "0")
+                            
+                            # Try both balance fields
+                            for bal_str in [balance_str, wallet_balance]:
+                                if bal_str and bal_str.strip() and bal_str != '0':
+                                    try:
+                                        balance = float(bal_str)
+                                        if balance > 0:
+                                            print(f"💰 Available SOL: {balance:.4f}")
+                                            return balance
+                                    except ValueError:
+                                        continue
+        except Exception as e:
+            print(f"❌ Error checking SOL balance: {e}")
+    
+    return 0.0  # No SOL available
+
 def get_account_balance():
     """Get USDT balance for position sizing with improved error handling"""
     account_types = ["UNIFIED", "SPOT"]  # Try different account types
@@ -229,8 +260,8 @@ def calculate_signal_strength(indicators, current_price, volatility):
         volatility > min_volatility_threshold     # Sufficient volatility
     ]
     
-    # Enhanced SHORT signal conditions  
-    short_conditions = [
+    # Enhanced SELL signal conditions (for spot trading)
+    sell_conditions = [
         rsi_15m > 55 and rsi_15m < 75,           # Overbought but not extreme
         rsi_1h > 45,                             # 1h trend not oversold
         rsi_4h > 40,                             # 4h trend bearish room
@@ -247,15 +278,15 @@ def calculate_signal_strength(indicators, current_price, volatility):
     ]
     
     long_score = sum(long_conditions)
-    short_score = sum(short_conditions)
+    sell_score = sum(sell_conditions)
     
     # Return the stronger signal
     if long_score >= signal_strength_threshold:
         return long_score, "LONG"
-    elif short_score >= signal_strength_threshold:
-        return short_score, "SHORT"
+    elif sell_score >= signal_strength_threshold:
+        return sell_score, "SELL"  # Changed from SHORT to SELL for spot trading
     else:
-        return max(long_score, short_score), None
+        return max(long_score, sell_score), None
 
 def can_trade():
     """Check if we can trade based on time and daily limits"""
@@ -279,35 +310,48 @@ def can_trade():
     return True, "Can trade"
 
 def place_optimized_order(direction, current_price, indicators, account_balance):
-    """Place order using full account balance"""
+    """Place order using full account balance or sell existing SOL"""
     
     atr_15m = indicators["15m"]["atr"]
     
-    # Calculate dynamic stop loss and take profit based on ATR
     if direction == "LONG":
-        # More conservative stops for better win rate
+        # BUY SOL with USDT
         stop_loss = current_price - (1.8 * atr_15m)
         take_profit = current_price + (min_reward_ratio * 1.8 * atr_15m)
         side = "Buy"
-        # Limit order slightly below market for better fill
         limit_price = current_price * 0.9998  # 0.02% below market
         
-    else:  # SHORT
-        stop_loss = current_price + (1.8 * atr_15m)
-        take_profit = current_price - (min_reward_ratio * 1.8 * atr_15m)
+        # Use full USDT balance
+        usable_balance = account_balance * 0.999  # Leave 0.1% for fees
+        position_size = usable_balance / limit_price  # Convert USDT to SOL quantity
+        
+        print(f"\n🎯 Placing {direction} order using FULL USDT BALANCE...")
+        print(f"💰 Available USDT: ${account_balance:.2f}")
+        print(f"💰 Position Size: {position_size:.2f} SOL")
+        
+    elif direction == "SELL":
+        # SELL existing SOL for USDT
+        stop_loss = current_price + (1.8 * atr_15m)  # Stop loss above current price
+        take_profit = current_price - (min_reward_ratio * 1.8 * atr_15m)  # Take profit below
         side = "Sell"
-        # Limit order slightly above market for better fill
         limit_price = current_price * 1.0002  # 0.02% above market
-    
-    # Use full account balance for position sizing
-    # Reserve small amount for fees (0.1% of balance)
-    usable_balance = account_balance * 0.999  # Leave 0.1% for fees
-    position_size = usable_balance / limit_price  # Convert USDT to SOL quantity
+        
+        # Check if we have SOL to sell
+        sol_balance = get_sol_balance()
+        if sol_balance < 0.01:
+            print("❌ No SOL available to sell")
+            return False
+            
+        position_size = sol_balance * 0.999  # Sell 99.9% of SOL (leave tiny amount for fees)
+        
+        print(f"\n🎯 Placing {direction} order using FULL SOL BALANCE...")
+        print(f"💰 Available SOL: {sol_balance:.4f}")
+        print(f"💰 Position Size: {position_size:.2f} SOL")
     
     # Ensure minimum order size
-    min_position = 0.01  # Minimum SOL order size
+    min_position = 0.01
     if position_size < min_position:
-        print(f"❌ Account balance too small. Need at least ${min_position * limit_price:.2f} USDT")
+        print(f"❌ Position size too small: {position_size:.4f} SOL")
         return False
     
     try:
@@ -336,19 +380,22 @@ def place_optimized_order(direction, current_price, indicators, account_balance)
         
         if result.get("retCode") == 0:
             print(f"✅ {direction} LIMIT order placed successfully!")
-            print(f"🎉 FULL BALANCE DEPLOYED: ${usable_balance:.2f} USDT")
-            print(f"💰 SOL Quantity: {position_size:.2f} SOL")
+            
+            if direction == "LONG":
+                usable_balance = account_balance * 0.999
+                potential_profit = (take_profit - limit_price) * position_size
+                print(f"🎉 FULL USDT BALANCE DEPLOYED: ${usable_balance:.2f}")
+                print(f"💰 SOL Acquired: {position_size:.2f} SOL")
+            else:  # SELL
+                expected_usdt = position_size * limit_price
+                potential_profit = (limit_price - take_profit) * position_size
+                print(f"🎉 FULL SOL BALANCE DEPLOYED: {position_size:.2f} SOL")
+                print(f"💰 Expected USDT: ${expected_usdt:.2f}")
+            
             print(f"🎯 Entry Price: ${limit_price:.2f}")
             print(f"🛑 Stop Loss: ${stop_loss:.2f}")
             print(f"💎 Take Profit: ${take_profit:.2f}")
             print(f"📊 Risk/Reward: 1:{min_reward_ratio}")
-            
-            # Calculate potential profit
-            if direction == "LONG":
-                potential_profit = (take_profit - limit_price) * position_size
-            else:
-                potential_profit = (limit_price - take_profit) * position_size
-            
             print(f"🎯 Potential Profit: ${potential_profit:.2f} USDT")
             
             # Update trading state
@@ -362,7 +409,7 @@ def place_optimized_order(direction, current_price, indicators, account_balance)
                 'stop': stop_loss,
                 'target': take_profit,
                 'order_id': result.get('result', {}).get('orderId'),
-                'investment': usable_balance
+                'investment': usable_balance if direction == "LONG" else expected_usdt
             }
             
             return True
@@ -387,25 +434,30 @@ def check_position_exit(current_price):
     
     # Calculate current P&L in both percentage and USDT
     if direction == "LONG":
+        # Long: bought SOL at entry_price, current value at current_price
         pnl_pct = (current_price - entry_price) / entry_price * 100
         pnl_usdt = (current_price - entry_price) * position_size
         current_value = current_price * position_size
-    else:
-        pnl_pct = (entry_price - current_price) / entry_price * 100
+    else:  # SELL
+        # Sell: sold SOL at entry_price, would need to buy back at current_price
+        pnl_pct = (entry_price - current_price) / entry_price * 100  # Profit if price dropped
         pnl_usdt = (entry_price - current_price) * position_size
-        current_value = current_price * position_size
+        current_value = current_price * position_size  # Cost to buy back
     
     print(f"📊 Current Position: {direction}")
     print(f"💰 P&L: {pnl_pct:+.2f}% | ${pnl_usdt:+.2f} USDT")
-    print(f"💵 Investment: ${investment:.2f} → Current Value: ${current_value:.2f}")
+    if direction == "LONG":
+        print(f"💵 Investment: ${investment:.2f} → Current Value: ${current_value:.2f}")
+    else:
+        print(f"💵 Sold for: ${investment:.2f} → Cost to buy back: ${current_value:.2f}")
     
     # Check stop loss
     if direction == "LONG" and current_price <= pos['stop']:
         print(f"🛑 STOP LOSS triggered at ${current_price:.2f}")
         close_position("LOSS")
         
-    elif direction == "SHORT" and current_price >= pos['stop']:
-        print(f"🛑 STOP LOSS triggered at ${current_price:.2f}")
+    elif direction == "SELL" and current_price >= pos['stop']:
+        print(f"🛑 STOP LOSS triggered at ${current_price:.2f} (price went UP)")
         close_position("LOSS")
     
     # Check take profit
@@ -413,8 +465,8 @@ def check_position_exit(current_price):
         print(f"🎯 TAKE PROFIT hit at ${current_price:.2f}")
         close_position("WIN")
         
-    elif direction == "SHORT" and current_price <= pos['target']:
-        print(f"🎯 TAKE PROFIT hit at ${current_price:.2f}")
+    elif direction == "SELL" and current_price <= pos['target']:
+        print(f"🎯 TAKE PROFIT hit at ${current_price:.2f} (price went DOWN)")
         close_position("WIN")
 
 def close_position(result_type):
@@ -423,8 +475,14 @@ def close_position(result_type):
         return
         
     pos = trading_state['current_position']
-    side = "Sell" if pos['direction'] == "LONG" else "Buy"
+    direction = pos['direction']
     position_size = pos['size']
+    
+    # Determine the closing side
+    if direction == "LONG":
+        side = "Sell"  # Close long position by selling SOL
+    else:  # direction == "SELL" 
+        side = "Buy"   # Close sell position by buying back SOL
     
     try:
         # Close position with market order
@@ -442,7 +500,6 @@ def close_position(result_type):
             
             # Calculate final P&L if we can get current price
             try:
-                # Get current market price for P&L calculation
                 response = requests.get(f"https://api.bybit.com/v5/market/kline", params={
                     "category": "spot", "symbol": symbol, "interval": "1", "limit": 1
                 })
@@ -453,15 +510,17 @@ def close_position(result_type):
                         entry_price = pos['entry']
                         investment = pos.get('investment', entry_price * position_size)
                         
-                        if pos['direction'] == "LONG":
+                        if direction == "LONG":
+                            # Long: bought SOL, now selling
                             final_value = current_price * position_size
                             pnl_usdt = final_value - investment
-                        else:
-                            final_value = current_price * position_size  
-                            pnl_usdt = investment - final_value
+                        else:  # SELL
+                            # Sell: sold SOL, now buying back
+                            cost_to_buyback = current_price * position_size
+                            pnl_usdt = investment - cost_to_buyback
                         
                         print(f"💰 Final P&L: ${pnl_usdt:+.2f} USDT")
-                        print(f"📊 Investment: ${investment:.2f} → Final Value: ${final_value:.2f}")
+                        print(f"📊 Investment: ${investment:.2f} → Final Value: ${final_value if direction == 'LONG' else cost_to_buyback:.2f}")
             except:
                 pass  # If P&L calculation fails, just continue
             
