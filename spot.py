@@ -369,7 +369,7 @@ def place_optimized_order(direction, current_price, indicators, account_balance)
             "symbol": symbol,
             "side": side,
             "orderType": "Limit",
-            "qty": str(round(position_size, 4)),      # SOL quantity: 4 decimals max
+            "qty": str(round(position_size, 2)),      # SOL quantity: 4 decimals max
             "price": str(round(limit_price, 2)),      # USDT price: 2 decimals
             "timeInForce": "GTC"
         }
