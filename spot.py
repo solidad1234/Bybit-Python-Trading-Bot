@@ -660,7 +660,7 @@ def run_optimized_bot():
             print(f"\n💤 Sleeping for 20 minutes... Next cycle at {(datetime.now() + timedelta(minutes=20)).strftime('%H:%M:%S')}")
             print("="*60)
             
-            time.sleep(1200)  # 20 minutes
+            time.sleep(300)  # 5 minutes
             
         except KeyboardInterrupt:
             print("\n🛑 Bot stopped by user")
