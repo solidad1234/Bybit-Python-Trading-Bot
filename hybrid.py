@@ -293,6 +293,24 @@ class HybridTradingBot:
         
         return indicators, current_price, volatility
     
+    def get_sol_balance(self):
+        """Get SOL balance for spot selling"""
+        try:
+            result = session.get_wallet_balance(accountType="UNIFIED")
+            if result.get("retCode") == 0:
+                account_list = result.get("result", {}).get("list", [])
+                if account_list:
+                    coins = account_list[0].get("coin", [])
+                    for coin in coins:
+                        if coin["coin"] == "SOL":
+                            balance = float(coin.get("walletBalance", "0"))
+                            return balance
+            return 0.0
+        except Exception as e:
+            print(f"❌ Error getting SOL balance: {e}")
+            return 0.0
+
+
     def check_btc_correlation(self):
         """Check Bitcoin trend correlation"""
         try:
@@ -601,20 +619,26 @@ class HybridTradingBot:
             return False
     
     def place_futures_order(self, signal, current_price, indicators):
-        """Place futures order with proper risk management and validation"""
+        """Enhanced futures order with better stop management"""
         
-        atr_15m = indicators["15m"]["atr"]
+        # Calculate enhanced stops using new method
+        stop_data = self.calculate_enhanced_stops(
+            signal['signal'], current_price, indicators, signal['strength']
+        )
         
-        if signal["signal"] == "LONG":
-            stop_loss = current_price - (1.5 * atr_15m)
-            take_profit = current_price + (min_reward_ratio * 1.5 * atr_15m)
-            side = "Buy"
-        else:  # SHORT
-            stop_loss = current_price + (1.5 * atr_15m)
-            take_profit = current_price - (min_reward_ratio * 1.5 * atr_15m)
-            side = "Sell"
+        stop_loss = stop_data['stop_loss']
+        take_profit = stop_data['take_profit']
         
-        # Calculate position size
+        print(f"\n🎯 Enhanced Stop Calculation:")
+        print(f"   Entry: ${current_price:.2f}")
+        print(f"   Stop Loss: ${stop_loss:.2f}")
+        print(f"   Take Profit: ${take_profit:.2f}")
+        print(f"   Risk: ${stop_data['risk_amount']:.2f}")
+        print(f"   Reward: ${stop_data['reward_amount']:.2f}")
+        print(f"   Ratio: {stop_data['reward_ratio']:.2f}:1")
+        print(f"   Method: {stop_data['method_used']}")
+        
+        # Calculate position size using enhanced stops
         position_data = self.calculate_futures_position_size(
             current_price, stop_loss, signal["leverage"]
         )
@@ -624,7 +648,7 @@ class HybridTradingBot:
             return False
         
         try:
-            # Try to set leverage (handle if already set)
+            # Set leverage (same as before)
             print(f"🔧 Setting leverage to {signal['leverage']:.1f}x...")
             try:
                 leverage_result = session.set_leverage(
@@ -634,45 +658,41 @@ class HybridTradingBot:
                     sellLeverage=str(int(signal["leverage"]))
                 )
                 
-                # Handle leverage setting result
                 if leverage_result.get("retCode") == 0:
                     print(f"✅ Leverage set successfully")
                 elif leverage_result.get("retCode") == 110043:
-                    print(f"ℹ️  Leverage already set to {signal['leverage']:.1f}x (continuing with order)")
+                    print(f"ℹ️  Leverage already set to {signal['leverage']:.1f}x (continuing)")
                 else:
-                    print(f"⚠️  Leverage setting response: {leverage_result.get('retMsg')} (continuing anyway)")
+                    print(f"⚠️  Leverage response: {leverage_result.get('retMsg')} (continuing)")
                     
             except Exception as leverage_error:
-                print(f"⚠️  Leverage setting error: {leverage_error} (continuing with order)")
+                print(f"⚠️  Leverage setting error: {leverage_error} (continuing)")
             
-            # Place the order regardless of leverage setting result
+            # Place the order
+            side = "Buy" if signal["signal"] == "LONG" else "Sell"
             order_params = {
                 "category": "linear",
                 "symbol": symbol,
                 "side": side,
                 "orderType": "Market",
-                "qty": f"{position_data['position_size']:.1f}"  # Format to 1 decimal place
+                "qty": f"{position_data['position_size']:.1f}"
             }
             
-            print(f"\n🚀 FUTURES {signal['signal']} Order:")
-            print(f"   💰 Margin: ${position_data['required_margin']:.2f} (30% allocation)")
+            print(f"\n🚀 ENHANCED FUTURES {signal['signal']} Order:")
+            print(f"   💰 Margin: ${position_data['required_margin']:.2f}")
             print(f"   📊 Position: {position_data['position_size']:.1f} SOL")
             print(f"   ⚡ Leverage: {signal['leverage']:.1f}x")
             print(f"   🎯 Entry: ${current_price:.2f}")
-            print(f"   🛑 Stop: ${stop_loss:.2f}")
-            print(f"   💎 Target: ${take_profit:.2f}")
-            print(f"   💀 Max Risk: ${position_data.get('actual_risk', position_data['risk_amount']):.2f}")
-            print(f"📋 Order params: {order_params}")
+            print(f"   🛡️  Enhanced Stop: ${stop_loss:.2f}")
+            print(f"   💎 Smart Target: ${take_profit:.2f}")
+            print(f"   💀 Max Risk: ${position_data['actual_risk']:.2f}")
             
             result = session.place_order(**order_params)
             
             if result.get("retCode") == 0:
-                print(f"✅ Futures {signal['signal']} order placed successfully!")
+                print(f"✅ Enhanced futures {signal['signal']} order placed successfully!")
                 
-                # Set stop loss and take profit as separate orders
-                order_id = result.get('result', {}).get('orderId')
-                
-                # Try to set stop loss
+                # Set enhanced stops
                 try:
                     stop_result = session.set_trading_stop(
                         category="linear",
@@ -681,12 +701,13 @@ class HybridTradingBot:
                         takeProfit=str(round(take_profit, 2))
                     )
                     if stop_result.get("retCode") == 0:
-                        print(f"✅ Stop loss and take profit set")
+                        print(f"✅ Enhanced stops set successfully")
                     else:
                         print(f"⚠️  Could not set stops: {stop_result.get('retMsg')}")
                 except Exception as e:
                     print(f"⚠️  Error setting stops: {e}")
                 
+                # Store position with enhanced data
                 hybrid_state['futures_position'] = {
                     'direction': signal['signal'],
                     'size': position_data['position_size'],
@@ -695,8 +716,14 @@ class HybridTradingBot:
                     'target': take_profit,
                     'leverage': signal['leverage'],
                     'margin': position_data['required_margin'],
-                    'order_id': order_id,
-                    'timestamp': datetime.now()
+                    'order_id': result.get('result', {}).get('orderId'),
+                    'timestamp': datetime.now(),
+                    # Enhanced tracking
+                    'exit_25_taken': False,
+                    'exit_50_taken': False,
+                    'stop_moved_to_be': False,
+                    'original_stop': stop_loss,
+                    'support_resistance': stop_data['support_resistance']
                 }
                 
                 hybrid_state['daily_futures_trades'] += 1
@@ -708,13 +735,13 @@ class HybridTradingBot:
                 return False
                 
         except Exception as e:
-            print(f"❌ Error placing futures order: {e}")
+            print(f"❌ Error placing enhanced futures order: {e}")
             return False
     
     def check_position_exits(self, current_price):
-        """Check if positions should be exited"""
+        """Enhanced position exit management with trailing stops and partial profits"""
         
-        # Check spot position
+        # Enhanced spot position management (keep existing logic but add trailing)
         if hybrid_state['spot_position']:
             pos = hybrid_state['spot_position']
             direction = pos['direction']
@@ -732,22 +759,41 @@ class HybridTradingBot:
                 print(f"🎯 SPOT TAKE PROFIT hit at ${current_price:.2f}")
                 self.close_spot_position("WIN")
         
-        # Check futures position
+        # ENHANCED futures position management
         if hybrid_state['futures_position']:
             pos = hybrid_state['futures_position']
             direction = pos['direction']
             
+            # 1. Check for partial profit taking
+            partial_exits = self.partial_position_management(pos, current_price, indicators)
+            
+            # 2. Update trailing stop
+            indicators = self.get_current_indicators()  # You'll need to pass this
+            new_stop = self.implement_trailing_stop(pos, current_price, indicators)
+            if new_stop and new_stop != pos['stop']:
+                pos['stop'] = new_stop
+                # Update stop on exchange
+                try:
+                    session.set_trading_stop(
+                        category="linear",
+                        symbol=symbol,
+                        stopLoss=str(round(new_stop, 2))
+                    )
+                except:
+                    pass
+            
+            # 3. Check exit conditions
             if direction == "LONG" and current_price <= pos['stop']:
-                print(f"🛑 FUTURES STOP LOSS hit at ${current_price:.2f}")
+                print(f"🛑 ENHANCED FUTURES STOP hit at ${current_price:.2f}")
                 self.close_futures_position("LOSS")
             elif direction == "LONG" and current_price >= pos['target']:
-                print(f"🎯 FUTURES TAKE PROFIT hit at ${current_price:.2f}")
+                print(f"🎯 ENHANCED FUTURES TARGET hit at ${current_price:.2f}")
                 self.close_futures_position("WIN")
             elif direction == "SHORT" and current_price >= pos['stop']:
-                print(f"🛑 FUTURES STOP LOSS hit at ${current_price:.2f}")
+                print(f"🛑 ENHANCED FUTURES STOP hit at ${current_price:.2f}")
                 self.close_futures_position("LOSS")
             elif direction == "SHORT" and current_price <= pos['target']:
-                print(f"🎯 FUTURES TAKE PROFIT hit at ${current_price:.2f}")
+                print(f"🎯 ENHANCED FUTURES TARGET hit at ${current_price:.2f}")
                 self.close_futures_position("WIN")
     
     def close_spot_position(self, result_type):
@@ -804,6 +850,241 @@ class HybridTradingBot:
         
         return True, "Can trade futures"
     
+    def get_current_indicators(self):
+        """Helper method to get current indicators for trailing stops"""
+        try:
+            data = self.fetch_multi_timeframe_data()
+            if data:
+                indicators, _, _ = self.calculate_indicators(data)
+                return indicators
+            return None
+        except:
+            return None
+        
+    def get_support_resistance_levels(self, indicators, current_price):
+        """Calculate dynamic support and resistance levels"""
+        
+        # Get recent highs and lows
+        tf_15m = indicators["15m"]
+        tf_1h = indicators["1h"]
+        
+        # Key technical levels
+        ema_21_15m = tf_15m["ema_21"]
+        ema_50_15m = tf_15m["ema_50"]
+        ema_21_1h = tf_1h["ema_21"]
+        ema_50_1h = tf_1h["ema_50"]
+        
+        bb_upper = tf_15m["bb_upper"]
+        bb_lower = tf_15m["bb_lower"]
+        
+        # Identify key levels
+        levels = [ema_21_15m, ema_50_15m, ema_21_1h, ema_50_1h, bb_upper, bb_lower]
+        
+        # Find nearest support (below current price)
+        supports = [level for level in levels if level < current_price]
+        nearest_support = max(supports) if supports else current_price * 0.95
+        
+        # Find nearest resistance (above current price)
+        resistances = [level for level in levels if level > current_price]
+        nearest_resistance = min(resistances) if resistances else current_price * 1.05
+        
+        # Simple Fibonacci levels (from recent swing)
+        swing_high = max(levels)
+        swing_low = min(levels)
+        fib_618 = swing_high - 0.618 * (swing_high - swing_low)
+        fib_382 = swing_high - 0.382 * (swing_high - swing_low)
+        
+        return {
+            'nearest_support': nearest_support,
+            'nearest_resistance': nearest_resistance,
+            'fib_618': fib_618,
+            'fib_382': fib_382,
+            'bb_upper': bb_upper,
+            'bb_lower': bb_lower
+        }
+
+    def calculate_enhanced_stops(self, direction, current_price, indicators, signal_strength):
+        """Calculate enhanced stop loss and take profit to avoid premature stop-outs"""
+        
+        atr_15m = indicators["15m"]["atr"]
+        atr_1h = indicators["1h"]["atr"]
+        
+        # Get support/resistance levels
+        support_resistance = self.get_support_resistance_levels(indicators, current_price)
+        
+        if direction == "SHORT":
+            # === ENHANCED STOP LOSS CALCULATION ===
+            
+            # Method 1: ATR-based (current method)
+            atr_stop = current_price + (1.5 * atr_15m)
+            
+            # Method 2: Resistance-based (better)
+            resistance_level = support_resistance['nearest_resistance']
+            resistance_stop = resistance_level + (0.4 * atr_15m)  # Buffer above resistance
+            
+            # Method 3: Signal strength adaptive (stronger signals get wider stops)
+            strength_multiplier = 1.3 + (signal_strength / 20)  # 1.3x to 1.8x based on signal
+            adaptive_stop = current_price + (strength_multiplier * atr_15m)
+            
+            # Method 4: Volatility-adjusted
+            volatility_factor = min(atr_1h / atr_15m, 2.0)  # Cap at 2x
+            volatility_stop = current_price + (1.8 * volatility_factor * atr_15m)
+            
+            # Use the WIDEST stop for safety (avoid premature exits)
+            stop_loss = max(atr_stop, resistance_stop, adaptive_stop, volatility_stop)
+            
+            # === ENHANCED TAKE PROFIT CALCULATION ===
+            
+            # Method 1: Support-based (better than fixed ratio)
+            support_level = support_resistance['nearest_support']
+            support_tp = support_level + (0.3 * atr_15m)  # Buffer above support
+            
+            # Method 2: Risk-ratio based (current method)
+            risk_amount = stop_loss - current_price
+            ratio_tp = current_price - (min_reward_ratio * risk_amount)
+            
+            # Method 3: Fibonacci levels
+            fib_tp = support_resistance['fib_618']  # 61.8% retracement level
+            
+            # Use the CLOSEST realistic target
+            take_profit = max(support_tp, ratio_tp, fib_tp)
+            
+            # Ensure minimum reward ratio
+            actual_reward_ratio = (current_price - take_profit) / (stop_loss - current_price)
+            if actual_reward_ratio < 1.8:  # Minimum 1.8:1 for aggressive leverage
+                take_profit = current_price - (1.8 * (stop_loss - current_price))
+        
+        else:  # LONG direction
+            # Similar logic but reversed
+            support_level = support_resistance['nearest_support']
+            resistance_level = support_resistance['nearest_resistance']
+            
+            # Enhanced stop loss below support
+            support_stop = support_level - (0.4 * atr_15m)
+            atr_stop = current_price - (1.5 * atr_15m)
+            strength_multiplier = 1.3 + (signal_strength / 20)
+            adaptive_stop = current_price - (strength_multiplier * atr_15m)
+            
+            # Use the LOWEST stop for safety
+            stop_loss = min(support_stop, atr_stop, adaptive_stop)
+            
+            # Enhanced take profit near resistance
+            resistance_tp = resistance_level - (0.3 * atr_15m)
+            risk_amount = current_price - stop_loss
+            ratio_tp = current_price + (min_reward_ratio * risk_amount)
+            
+            take_profit = min(resistance_tp, ratio_tp)
+        
+        return {
+            'stop_loss': round(stop_loss, 2),
+            'take_profit': round(take_profit, 2),
+            'risk_amount': abs(stop_loss - current_price),
+            'reward_amount': abs(take_profit - current_price),
+            'reward_ratio': abs(take_profit - current_price) / abs(stop_loss - current_price),
+            'method_used': 'enhanced_multi_criteria',
+            'support_resistance': support_resistance
+        }
+
+    def implement_trailing_stop(self, position, current_price, indicators):
+        """Implement trailing stop to lock in profits"""
+        
+        if not position:
+            return None
+        
+        direction = position['direction']
+        entry_price = position['entry']
+        current_stop = position['stop']
+        atr_15m = indicators["15m"]["atr"]
+        
+        if direction == "SHORT":
+            # For SHORT: trailing stop moves DOWN as price moves DOWN (in our favor)
+            unrealized_pnl_pct = (entry_price - current_price) / entry_price
+            
+            if unrealized_pnl_pct > 0.02:  # 2% profit
+                # Move stop down by 50% of the favorable move
+                favorable_move = entry_price - current_price
+                new_stop = current_stop - (0.5 * favorable_move)
+                
+                # Don't move stop less favorable
+                new_stop = min(new_stop, current_stop)
+                
+                # Ensure minimum buffer for high leverage
+                min_stop = current_price + (1.0 * atr_15m)  # Tighter for high leverage
+                final_stop = max(new_stop, min_stop)
+                
+                if final_stop != current_stop:
+                    print(f"🔄 Trailing stop: ${current_stop:.2f} → ${final_stop:.2f}")
+                
+                return final_stop
+        
+        else:  # LONG
+            # For LONG: trailing stop moves UP as price moves UP
+            unrealized_pnl_pct = (current_price - entry_price) / entry_price
+            
+            if unrealized_pnl_pct > 0.02:  # 2% profit
+                favorable_move = current_price - entry_price
+                new_stop = current_stop + (0.5 * favorable_move)
+                
+                # Don't move stop less favorable
+                new_stop = max(new_stop, current_stop)
+                
+                # Ensure minimum buffer
+                max_stop = current_price - (1.0 * atr_15m)
+                final_stop = min(new_stop, max_stop)
+                
+                if final_stop != current_stop:
+                    print(f"🔄 Trailing stop: ${current_stop:.2f} → ${final_stop:.2f}")
+                
+                return final_stop
+        
+        return current_stop  # No change
+
+    def partial_position_management(self, position, current_price, indicators):
+        """Take partial profits to reduce risk of full stop-out"""
+        
+        if not position:
+            return None
+        
+        direction = position['direction']
+        entry_price = position['entry']
+        
+        # Calculate unrealized P&L
+        if direction == "SHORT":
+            pnl_pct = (entry_price - current_price) / entry_price
+        else:  # LONG
+            pnl_pct = (current_price - entry_price) / entry_price
+        
+        partial_exits = []
+        
+        # Take 25% profit at 1.5:1 risk/reward (adjusted for high leverage)
+        if pnl_pct >= 0.02 and not position.get('exit_25_taken'):  # 2% profit
+            partial_exits.append({
+                'percentage': 0.25,
+                'reason': '1.5:1_risk_reward',
+                'price': current_price
+            })
+            position['exit_25_taken'] = True
+            print(f"💰 Taking 25% profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
+        
+        # Take another 25% at 2.5:1 risk/reward  
+        if pnl_pct >= 0.04 and not position.get('exit_50_taken'):  # 4% profit
+            partial_exits.append({
+                'percentage': 0.25,
+                'reason': '2.5:1_risk_reward', 
+                'price': current_price
+            })
+            position['exit_50_taken'] = True
+            print(f"💰 Taking 25% more profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
+        
+        # Move stop to breakeven after taking 50% profit
+        if position.get('exit_50_taken') and not position.get('stop_moved_to_be'):
+            position['stop'] = entry_price
+            position['stop_moved_to_be'] = True
+            print(f"🛡️  Stop moved to breakeven: ${entry_price:.2f}")
+        
+        return partial_exits
+
+
     def run_hybrid_strategy(self):
         """Main hybrid strategy execution"""
         
@@ -949,3 +1230,5 @@ class HybridTradingBot:
 if __name__ == "__main__":
     bot = HybridTradingBot()
     bot.run_bot()
+
+
