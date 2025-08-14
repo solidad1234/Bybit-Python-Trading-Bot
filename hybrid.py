@@ -39,7 +39,7 @@ min_volatility_threshold = 0.02
 
 # Trading Limits
 max_daily_trades_spot = 3
-max_daily_trades_futures = 5
+max_daily_trades_futures = 15
 min_trade_gap_hours = 2
 signal_strength_threshold = 5  # Increased from 3
 
