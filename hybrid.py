@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Hybrid Spot + Futures Trading Bot
 Independent implementation that can run alongside existing spot.py
@@ -33,7 +32,7 @@ FUTURES_ALLOCATION = 0.30  # 30% for futures trading
 # Risk Management
 spot_risk_per_trade = 0.99  # Use 99% of spot allocation (like current bot)
 futures_risk_per_trade = 0.05  # 5% risk per futures trade
-max_leverage = 3.0         # Conservative max leverage
+max_leverage = 20.0         # Conservative max leverage
 min_reward_ratio = 2.5     # Minimum reward:risk ratio
 min_volatility_threshold = 0.02
 
@@ -407,13 +406,13 @@ class HybridTradingBot:
         short_score = sum(futures_short_conditions)
         
         if long_score >= 5:
-            return {"signal": "LONG", "strength": long_score, "type": "futures", "leverage": 2.0}
+            return {"signal": "LONG", "strength": long_score, "type": "futures", "leverage": 10.0}
         elif short_score >= 6:  # Higher threshold for shorts
-            return {"signal": "SHORT", "strength": short_score, "type": "futures", "leverage": 2.5}
+            return {"signal": "SHORT", "strength": short_score, "type": "futures", "leverage": 10.5}
         
         return {"signal": None, "strength": max(long_score, short_score), "type": "futures"}
     
-    def calculate_futures_position_size(self, entry_price, stop_loss_price, leverage=2.0):
+    def calculate_futures_position_size(self, entry_price, stop_loss_price, leverage=10.0):
         """Calculate safe futures position size with proper USDT margin validation"""
         
         # Get actual USDT balance (required for futures margin)
