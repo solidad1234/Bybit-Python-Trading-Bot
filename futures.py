@@ -721,7 +721,7 @@ class FuturesTradingBot:
         
         # Display status
         print(f"\n📊 Status:")
-        print(f"🚀 Position: {futures_state['position']['direction'] if futures_state['position'] else 'None'}")
+        print(f"🚀 Current Position: {futures_state['position']['direction'] if futures_state['position'] else 'None'}")
         print(f"📈 Daily Trades: {futures_state['daily_trades']}/{max_daily_trades}")
         print(f"💰 Available Balance: ${futures_state['available_balance']:.2f}")
         
