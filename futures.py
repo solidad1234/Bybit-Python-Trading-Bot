@@ -562,68 +562,55 @@ class FuturesTradingBot:
                 self.close_position("WIN")
     
     def implement_trailing_stop(self, position, current_price, indicators):
-        """Implement trailing stop to lock in profits - FIXED to only move favorably"""
-        
+        """Implement trailing stop to lock in profits - price-based trailing"""
+
         if not position:
             return None
-        
+
         direction = position['direction']
         entry_price = position['entry']
         current_stop = position['stop']
         atr_15m = indicators["15m"]["atr"]
-        
+
         if direction == "SHORT":
-            # Update lowest price (most favorable for SHORT)
+            # Track the lowest price reached (best for SHORT)
             if 'lowest_price' not in position or current_price < position['lowest_price']:
                 position['lowest_price'] = current_price
-                print(f"📈 New best SHORT price: ${current_price:.2f}")
-            
+                print(f"📉 New best SHORT price: ${current_price:.2f}")
+
             best_price = position['lowest_price']
             unrealized_pnl_pct = (entry_price - best_price) / entry_price
-            
-            if unrealized_pnl_pct > 0.02:  # 2% profit from best price
-                # Calculate stop based on BEST price achieved, not current price
-                favorable_move = entry_price - best_price
-                proposed_stop = current_stop - (0.5 * favorable_move)
-                
-                # Only move stop if it's MORE favorable (lower for SHORT)
+
+            if unrealized_pnl_pct > 0.02:  # at least 2% profit
+                # Place stop just above best price with ATR buffer
+                proposed_stop = best_price + (1.0 * atr_15m)
+
+                # Only update if better (lower than before)
                 if proposed_stop < current_stop:
-                    # Ensure minimum buffer from BEST price (not current price)
-                    min_stop = best_price + (1.0 * atr_15m)
-                    final_stop = max(proposed_stop, min_stop)
-                    
-                    # Only update if the new stop is actually better
-                    if final_stop < current_stop:
-                        print(f"🔄 Trailing stop (SHORT): ${current_stop:.2f} → ${final_stop:.2f} (based on best: ${best_price:.2f})")
-                        return final_stop
-        
+                    print(f"🔄 Trailing stop (SHORT): ${current_stop:.2f} → ${proposed_stop:.2f}")
+                    return proposed_stop
+
         else:  # LONG
-            # Update highest price (most favorable for LONG)
+            # Track the highest price reached (best for LONG)
             if 'highest_price' not in position or current_price > position['highest_price']:
                 position['highest_price'] = current_price
                 print(f"📈 New best LONG price: ${current_price:.2f}")
-            
+
             best_price = position['highest_price']
             unrealized_pnl_pct = (best_price - entry_price) / entry_price
-            
-            if unrealized_pnl_pct > 0.02:  # 2% profit from best price
-                # Calculate stop based on BEST price achieved, not current price
-                favorable_move = best_price - entry_price
-                proposed_stop = current_stop + (0.5 * favorable_move)
-                
-                # Only move stop if it's MORE favorable (higher for LONG)
+
+            if unrealized_pnl_pct > 0.02:  # at least 2% profit
+                # Place stop just below best price with ATR buffer
+                proposed_stop = best_price - (1.0 * atr_15m)
+
+                # Only update if better (higher than before)
                 if proposed_stop > current_stop:
-                    # Ensure minimum buffer from BEST price (not current price)
-                    max_stop = best_price - (1.0 * atr_15m)
-                    final_stop = min(proposed_stop, max_stop)
-                    
-                    # Only update if the new stop is actually better
-                    if final_stop > current_stop:
-                        print(f"🔄 Trailing stop (LONG): ${current_stop:.2f} → ${final_stop:.2f} (based on best: ${best_price:.2f})")
-                        return final_stop
-        
-        # No change in stop
+                    print(f"🔄 Trailing stop (LONG): ${current_stop:.2f} → ${proposed_stop:.2f}")
+                    return proposed_stop
+
+        # No change
         return current_stop
+
     
     def partial_position_management(self, position, current_price, indicators):
         """Take partial profits to reduce risk"""
