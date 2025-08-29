@@ -1,5 +1,5 @@
 """
-Standalone Futures Trading Bot 
+Standalone Futures Trading Bot - Extracted from Hybrid Bot
 Focus: Pure futures trading with enhanced risk management
 """
 
@@ -502,7 +502,10 @@ class FuturesTradingBot:
                     'exit_25_taken': False,
                     'exit_50_taken': False,
                     'stop_moved_to_be': False,
-                    'original_stop': stop_loss
+                    'original_stop': stop_loss,
+                    # Track best price for trailing stop
+                    'highest_price': current_price,  # For LONG positions
+                    'lowest_price': current_price    # For SHORT positions
                 }
                 
                 futures_state['daily_trades'] += 1
@@ -559,7 +562,7 @@ class FuturesTradingBot:
                 self.close_position("WIN")
     
     def implement_trailing_stop(self, position, current_price, indicators):
-        """Implement trailing stop to lock in profits"""
+        """Implement trailing stop to lock in profits - FIXED to only move favorably"""
         
         if not position:
             return None
@@ -570,37 +573,56 @@ class FuturesTradingBot:
         atr_15m = indicators["15m"]["atr"]
         
         if direction == "SHORT":
-            unrealized_pnl_pct = (entry_price - current_price) / entry_price
+            # Update lowest price (most favorable for SHORT)
+            if 'lowest_price' not in position or current_price < position['lowest_price']:
+                position['lowest_price'] = current_price
+                print(f"📈 New best SHORT price: ${current_price:.2f}")
             
-            if unrealized_pnl_pct > 0.02:  # 2% profit
-                favorable_move = entry_price - current_price
-                new_stop = current_stop - (0.5 * favorable_move)
-                new_stop = min(new_stop, current_stop)
+            best_price = position['lowest_price']
+            unrealized_pnl_pct = (entry_price - best_price) / entry_price
+            
+            if unrealized_pnl_pct > 0.02:  # 2% profit from best price
+                # Calculate stop based on BEST price achieved, not current price
+                favorable_move = entry_price - best_price
+                proposed_stop = current_stop - (0.5 * favorable_move)
                 
-                min_stop = current_price + (1.0 * atr_15m)
-                final_stop = max(new_stop, min_stop)
-                
-                if final_stop != current_stop:
-                    print(f"🔄 Trailing stop: ${current_stop:.2f} → ${final_stop:.2f}")
-                
-                return final_stop
+                # Only move stop if it's MORE favorable (lower for SHORT)
+                if proposed_stop < current_stop:
+                    # Ensure minimum buffer from BEST price (not current price)
+                    min_stop = best_price + (1.0 * atr_15m)
+                    final_stop = max(proposed_stop, min_stop)
+                    
+                    # Only update if the new stop is actually better
+                    if final_stop < current_stop:
+                        print(f"🔄 Trailing stop (SHORT): ${current_stop:.2f} → ${final_stop:.2f} (based on best: ${best_price:.2f})")
+                        return final_stop
         
         else:  # LONG
-            unrealized_pnl_pct = (current_price - entry_price) / entry_price
+            # Update highest price (most favorable for LONG)
+            if 'highest_price' not in position or current_price > position['highest_price']:
+                position['highest_price'] = current_price
+                print(f"📈 New best LONG price: ${current_price:.2f}")
             
-            if unrealized_pnl_pct > 0.02:  # 2% profit
-                favorable_move = current_price - entry_price
-                new_stop = current_stop + (0.5 * favorable_move)
-                new_stop = max(new_stop, current_stop)
+            best_price = position['highest_price']
+            unrealized_pnl_pct = (best_price - entry_price) / entry_price
+            
+            if unrealized_pnl_pct > 0.02:  # 2% profit from best price
+                # Calculate stop based on BEST price achieved, not current price
+                favorable_move = best_price - entry_price
+                proposed_stop = current_stop + (0.5 * favorable_move)
                 
-                max_stop = current_price - (1.0 * atr_15m)
-                final_stop = min(new_stop, max_stop)
-                
-                if final_stop != current_stop:
-                    print(f"🔄 Trailing stop: ${current_stop:.2f} → ${final_stop:.2f}")
-                
-                return final_stop
+                # Only move stop if it's MORE favorable (higher for LONG)
+                if proposed_stop > current_stop:
+                    # Ensure minimum buffer from BEST price (not current price)
+                    max_stop = best_price - (1.0 * atr_15m)
+                    final_stop = min(proposed_stop, max_stop)
+                    
+                    # Only update if the new stop is actually better
+                    if final_stop > current_stop:
+                        print(f"🔄 Trailing stop (LONG): ${current_stop:.2f} → ${final_stop:.2f} (based on best: ${best_price:.2f})")
+                        return final_stop
         
+        # No change in stop
         return current_stop
     
     def partial_position_management(self, position, current_price, indicators):
@@ -721,7 +743,7 @@ class FuturesTradingBot:
         
         # Display status
         print(f"\n📊 Status:")
-        print(f"🚀 Current Position: {futures_state['position']['direction'] if futures_state['position'] else 'None'}")
+        print(f"🚀 Position: {futures_state['position']['direction'] if futures_state['position'] else 'None'}")
         print(f"📈 Daily Trades: {futures_state['daily_trades']}/{max_daily_trades}")
         print(f"💰 Available Balance: ${futures_state['available_balance']:.2f}")
         
