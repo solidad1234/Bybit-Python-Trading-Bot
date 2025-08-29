@@ -274,8 +274,8 @@ class FuturesTradingBot:
             print(f"❌ Insufficient USDT for futures margin: ${usdt_balance:.2f} (minimum $5)")
             return None
         
-        # Use conservative margin - max 50% of available USDT for safety
-        max_usable_margin = usdt_balance * 0.5
+        # Use conservative margin - max 70% of available USDT for safety
+        max_usable_margin = usdt_balance * 0.7
         risk_amount = usdt_balance * futures_risk_per_trade  # 5% of USDT balance
         
         # Distance to stop loss
