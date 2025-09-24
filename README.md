@@ -1,5 +1,21 @@
 # 🚀 Bybit Python Trading Bot
 
+---
+
+## ⚠️ Disclaimer
+
+Cryptocurrency assets are highly volatile and carry significant risk.  
+This bot is provided **for educational and research purposes only**.  
+There are **no guarantees of profit**, and you could lose some or all of your capital.  
+
+- Do your own research (DYOR) before using this bot.  
+- Test extensively in a demo/sandbox environment first.  
+- Only trade with money you can afford to lose.  
+- The author(s) of this project are **not responsible** for any financial losses incurred.  
+
+By using this bot, you acknowledge and accept these risks.
+
+
 This repository contains **three automated crypto trading bots** for **Bybit**, built with Python — **spot trading**, **futures trading**, and **hybrid trading** (combining both). Each bot is designed for real-time execution and can be deployed on a VPS for continuous operation.
 
 ## 🤖 Available Trading Bots
