@@ -14,6 +14,7 @@ from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 import os
 import json
+import csv
 
 # Load environment variables
 load_dotenv()
@@ -26,7 +27,7 @@ primary_timeframe = "15"   # Primary analysis
 higher_timeframe = "60"    # Trend confirmation
 
 # Futures Risk Management
-futures_risk_per_trade = 0.05  # 5% risk per futures trade
+futures_risk_per_trade = 0.015  # 1.5% risk per futures trade (Institutional Risk)
 max_leverage = 20.0            # Conservative max leverage
 min_reward_ratio = 3.0         # Minimum reward:risk ratio (3:1)
 min_volatility_threshold = 0.02
@@ -60,7 +61,110 @@ class FuturesTradingBot:
     
     def __init__(self):
         print(f"🚀 Initializing Futures Trading Bot...")
+        self.state_file = "futures_state.json"
+        self.load_state()
         self.initialize_balance()
+        
+    def save_state(self):
+        """Save critical state to disk"""
+        try:
+            state_to_save = {
+                'position': self.serialize_position(futures_state['position']),
+                'daily_trades': futures_state['daily_trades'],
+                'total_trades': futures_state['total_trades'],
+                'winning_trades': futures_state['winning_trades'],
+                'consecutive_losses': futures_state['consecutive_losses']
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(state_to_save, f)
+        except Exception as e:
+            print(f"⚠️ Error saving state: {e}")
+
+    def load_state(self):
+        """Load state from disk"""
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    saved_state = json.load(f)
+                    futures_state['position'] = self.deserialize_position(saved_state.get('position'))
+                    futures_state['daily_trades'] = saved_state.get('daily_trades', 0)
+                    futures_state['total_trades'] = saved_state.get('total_trades', 0)
+                    futures_state['winning_trades'] = saved_state.get('winning_trades', 0)
+                    futures_state['consecutive_losses'] = saved_state.get('consecutive_losses', 0)
+                print("✅ State loaded successfully")
+            except Exception as e:
+                print(f"⚠️ Error loading state: {e}")
+
+    def serialize_position(self, pos):
+        if not pos: return None
+        pos_copy = pos.copy()
+        if 'timestamp' in pos_copy and isinstance(pos_copy['timestamp'], datetime):
+            pos_copy['timestamp'] = pos_copy['timestamp'].isoformat()
+        return pos_copy
+
+    def deserialize_position(self, pos):
+        if not pos: return None
+        if 'timestamp' in pos and isinstance(pos['timestamp'], str):
+            pos['timestamp'] = datetime.fromisoformat(pos['timestamp'])
+        return pos
+
+    def log_features(self, current_price, indicators, btc_data, volatility):
+        """Log features for AI training"""
+        file_exists = os.path.isfile('ai_training_data.csv')
+        try:
+            with open('ai_training_data.csv', mode='a', newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(['timestamp', 'current_price', 'rsi_15m', 'rsi_1h', 'macd_15m', 
+                                     'macd_hist_15m', 'adx_15m', 'adx_1h', 'volatility', 
+                                     'btc_1h_change', 'btc_4h_change', 'volume_ratio_15m'])
+                
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    current_price,
+                    indicators['15m']['rsi'],
+                    indicators['1h']['rsi'],
+                    indicators['15m']['macd'],
+                    indicators['15m']['macd_histogram'],
+                    indicators['15m']['adx'],
+                    indicators['1h']['adx'],
+                    volatility,
+                    btc_data['1h_change'],
+                    btc_data['4h_change'],
+                    indicators['15m']['volume_ratio']
+                ])
+        except Exception as e:
+            print(f"⚠️ Error logging features: {e}")
+
+    def log_trade_outcome(self, pnl=None, exit_price=None):
+        """Log outcome for AI training"""
+        pos = futures_state['position']
+        if not pos: return
+        
+        file_exists = os.path.isfile('ai_trade_outcomes.csv')
+        try:
+            with open('ai_trade_outcomes.csv', mode='a', newline='') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(['entry_time', 'exit_time', 'direction', 'entry_price', 
+                                     'exit_price', 'pnl', 'max_favorable_price', 'max_adverse_price'])
+                
+                entry_time = pos.get('timestamp')
+                if isinstance(entry_time, datetime):
+                    entry_time = entry_time.isoformat()
+                    
+                writer.writerow([
+                    entry_time,
+                    datetime.now().isoformat(),
+                    pos['direction'],
+                    pos['entry'],
+                    exit_price or pos.get('target'),
+                    pnl or 0,
+                    pos.get('highest_price', pos['entry']),
+                    pos.get('lowest_price', pos['entry'])
+                ])
+        except Exception as e:
+            print(f"⚠️ Error logging outcome: {e}")
         
     def initialize_balance(self):
         """Initialize futures trading balance"""
@@ -104,29 +208,24 @@ class FuturesTradingBot:
         data = {}
         
         for tf in [primary_timeframe, higher_timeframe, "240"]:  # 15m, 1h, 4h
-            url = f"https://api.bybit.com/v5/market/kline"
-            params = {
-                "category": "spot",
-                "symbol": symbol,
-                "interval": tf,
-                "limit": 100
-            }
-            
             try:
-                response = requests.get(url, params=params, timeout=10)
-                if response.status_code == 200:
-                    result = response.json()
-                    if result["retCode"] == 0:
-                        candles = result["result"]["list"]
-                        candles = list(reversed(candles))
-                        
-                        data[tf] = {
-                            'close': np.array([float(c[4]) for c in candles]),
-                            'high': np.array([float(c[2]) for c in candles]),
-                            'low': np.array([float(c[3]) for c in candles]),
-                            'volume': np.array([float(c[5]) for c in candles]),
-                            'timestamp': [int(c[0]) for c in candles]
-                        }
+                result = session.get_kline(
+                    category="linear",
+                    symbol=symbol,
+                    interval=tf,
+                    limit=100
+                )
+                if result.get("retCode") == 0:
+                    candles = result["result"]["list"]
+                    candles = list(reversed(candles))
+                    
+                    data[tf] = {
+                        'close': np.array([float(c[4]) for c in candles]),
+                        'high': np.array([float(c[2]) for c in candles]),
+                        'low': np.array([float(c[3]) for c in candles]),
+                        'volume': np.array([float(c[5]) for c in candles]),
+                        'timestamp': [int(c[0]) for c in candles]
+                    }
             except Exception as e:
                 print(f"❌ Error fetching {tf} data: {e}")
                 return None
@@ -189,30 +288,25 @@ class FuturesTradingBot:
     def check_btc_correlation(self):
         """Check Bitcoin trend correlation"""
         try:
-            url = "https://api.bybit.com/v5/market/kline"
-            params = {
-                "category": "spot",
-                "symbol": "BTCUSDT",
-                "interval": "60",
-                "limit": 10
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                result = response.json()
-                if result["retCode"] == 0:
-                    candles = result["result"]["list"]
-                    candles = list(reversed(candles))
-                    
-                    btc_closes = [float(c[4]) for c in candles]
-                    btc_current = btc_closes[-1]
-                    btc_1h_ago = btc_closes[-2] if len(btc_closes) > 1 else btc_current
-                    btc_4h_ago = btc_closes[-5] if len(btc_closes) > 4 else btc_current
-                    
-                    btc_1h_change = (btc_current - btc_1h_ago) / btc_1h_ago * 100
-                    btc_4h_change = (btc_current - btc_4h_ago) / btc_4h_ago * 100
-                    
-                    return {
+            result = session.get_kline(
+                category="linear",
+                symbol="BTCUSDT",
+                interval="60",
+                limit=10
+            )
+            if result.get("retCode") == 0:
+                candles = result["result"]["list"]
+                candles = list(reversed(candles))
+                
+                btc_closes = [float(c[4]) for c in candles]
+                btc_current = btc_closes[-1]
+                btc_1h_ago = btc_closes[-2] if len(btc_closes) > 1 else btc_current
+                btc_4h_ago = btc_closes[-5] if len(btc_closes) > 4 else btc_current
+                
+                btc_1h_change = (btc_current - btc_1h_ago) / btc_1h_ago * 100
+                btc_4h_change = (btc_current - btc_4h_ago) / btc_4h_ago * 100
+                
+                return {
                         'bullish': btc_1h_change > -1.0 and btc_4h_change > -2.0,
                         'bearish': btc_1h_change < -2.0 or btc_4h_change < -5.0,
                         '1h_change': btc_1h_change,
@@ -510,6 +604,7 @@ class FuturesTradingBot:
                 
                 futures_state['daily_trades'] += 1
                 futures_state['total_trades'] += 1
+                self.save_state()
                 
                 return True
             else:
@@ -520,8 +615,45 @@ class FuturesTradingBot:
             print(f"❌ Error placing futures order: {e}")
             return False
     
+    def sync_position_with_bybit(self):
+        """Sync local position state with Bybit API"""
+        if not futures_state['position']: return
+        
+        try:
+            result = session.get_positions(
+                category="linear",
+                symbol=symbol
+            )
+            if result.get("retCode") == 0:
+                positions = result.get("result", {}).get("list", [])
+                active_pos = next((p for p in positions if float(p.get("size", 0)) > 0), None)
+                
+                if not active_pos:
+                    print("⚠️ Bybit reports no open position, but local state had one. Resolving...")
+                    # Get closed PnL to determine if win or loss
+                    pnl_result = session.get_closed_pnl(
+                        category="linear",
+                        symbol=symbol,
+                        limit=1
+                    )
+                    win = False
+                    pnl = 0
+                    if pnl_result.get("retCode") == 0:
+                        pnl_list = pnl_result.get("result", {}).get("list", [])
+                        if pnl_list:
+                            pnl = float(pnl_list[0].get("closedPnl", 0))
+                            win = pnl > 0
+                    
+                    print(f"🔄 Sync: Position closed externally. PnL: {pnl:.2f}")
+                    self.log_trade_outcome(pnl=pnl)
+                    self.close_position("WIN" if win else "LOSS", log_already_done=True)
+        except Exception as e:
+            print(f"❌ Error syncing position: {e}")
+
     def check_position_exits(self, current_price, indicators):
         """Check and manage position exits"""
+        
+        self.sync_position_with_bybit()
         
         if not futures_state['position']:
             return
@@ -542,6 +674,7 @@ class FuturesTradingBot:
                     symbol=symbol,
                     stopLoss=str(round(new_stop, 2))
                 )
+                self.save_state()
             except:
                 pass
         
@@ -549,17 +682,17 @@ class FuturesTradingBot:
         if direction == "LONG":
             if current_price <= pos['stop']:
                 print(f"🛑 STOP LOSS hit at ${current_price:.2f}")
-                self.close_position("LOSS")
+                self.close_position("LOSS", exit_price=current_price)
             elif current_price >= pos['target']:
                 print(f"🎯 TAKE PROFIT hit at ${current_price:.2f}")
-                self.close_position("WIN")
+                self.close_position("WIN", exit_price=current_price)
         else:  # SHORT
             if current_price >= pos['stop']:
                 print(f"🛑 STOP LOSS hit at ${current_price:.2f}")
-                self.close_position("LOSS")
+                self.close_position("LOSS", exit_price=current_price)
             elif current_price <= pos['target']:
                 print(f"🎯 TAKE PROFIT hit at ${current_price:.2f}")
-                self.close_position("WIN")
+                self.close_position("WIN", exit_price=current_price)
     
     def implement_trailing_stop(self, position, current_price, indicators):
         """Implement trailing stop to lock in profits - price-based trailing"""
@@ -627,23 +760,30 @@ class FuturesTradingBot:
         else:  # LONG
             pnl_pct = (current_price - entry_price) / entry_price
         
+        changed = False
         # Take 25% profit at 2% gain
         if pnl_pct >= 0.02 and not position.get('exit_25_taken'):
             position['exit_25_taken'] = True
             print(f"💰 Taking 25% profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
+            changed = True
         
         # Take another 25% at 4% gain
         if pnl_pct >= 0.04 and not position.get('exit_50_taken'):
             position['exit_50_taken'] = True
             print(f"💰 Taking 25% more profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
+            changed = True
         
         # Move stop to breakeven after 50% taken
         if position.get('exit_50_taken') and not position.get('stop_moved_to_be'):
             position['stop'] = entry_price
             position['stop_moved_to_be'] = True
             print(f"🛡️ Stop moved to breakeven: ${entry_price:.2f}")
+            changed = True
+            
+        if changed:
+            self.save_state()
     
-    def close_position(self, result_type):
+    def close_position(self, result_type, log_already_done=False, exit_price=None):
         """Close futures position"""
         if not futures_state['position']:
             return
@@ -651,6 +791,9 @@ class FuturesTradingBot:
         pos = futures_state['position']
         print(f"🚀 Closing futures {pos['direction']} position")
         
+        if not log_already_done:
+            self.log_trade_outcome(exit_price=exit_price)
+            
         # Update statistics
         if result_type == "WIN":
             futures_state['winning_trades'] += 1
@@ -659,6 +802,7 @@ class FuturesTradingBot:
             futures_state['consecutive_losses'] += 1
         
         futures_state['position'] = None
+        self.save_state()
     
     def can_trade(self):
         """Check if trading is allowed"""
@@ -690,6 +834,9 @@ class FuturesTradingBot:
         
         # Check BTC correlation
         btc_data = self.check_btc_correlation()
+        
+        # Log features for AI Data Pipeline
+        self.log_features(current_price, indicators, btc_data, volatility)
         
         # Check position exits
         self.check_position_exits(current_price, indicators)
