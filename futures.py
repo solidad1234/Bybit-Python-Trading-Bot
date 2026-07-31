@@ -64,6 +64,7 @@ class FuturesTradingBot:
         self.init_db()
         self.load_position_state()
         self.initialize_balance()
+        self.state_file = 'trading_state.json'
 
     def init_db(self):
         """Initialize SQLite database for state persistence"""
@@ -87,6 +88,36 @@ class FuturesTradingBot:
                 original_stop REAL,
                 highest_price REAL,
                 lowest_price REAL
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ai_training_data (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT,
+                current_price REAL,
+                rsi_15m REAL,
+                rsi_1h REAL,
+                macd_15m REAL,
+                macd_hist_15m REAL,
+                adx_15m REAL,
+                adx_1h REAL,
+                volatility REAL,
+                btc_1h_change REAL,
+                btc_4h_change REAL,
+                volume_ratio_15m REAL
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ai_trade_outcomes (
+                id INTEGER PRIMARY KEY,
+                entry_time TEXT,
+                exit_time TEXT,
+                direction TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                pnl REAL,
+                max_favorable_price REAL,
+                max_adverse_price REAL
             )
         ''')
         self.conn.commit()
@@ -204,29 +235,28 @@ class FuturesTradingBot:
 
     def log_features(self, current_price, indicators, btc_data, volatility):
         """Log features for AI training"""
-        file_exists = os.path.isfile('ai_training_data.csv')
         try:
-            with open('ai_training_data.csv', mode='a', newline='') as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(['timestamp', 'current_price', 'rsi_15m', 'rsi_1h', 'macd_15m', 
-                                     'macd_hist_15m', 'adx_15m', 'adx_1h', 'volatility', 
-                                     'btc_1h_change', 'btc_4h_change', 'volume_ratio_15m'])
-                
-                writer.writerow([
-                    datetime.now().isoformat(),
-                    current_price,
-                    indicators['15m']['rsi'],
-                    indicators['1h']['rsi'],
-                    indicators['15m']['macd'],
-                    indicators['15m']['macd_histogram'],
-                    indicators['15m']['adx'],
-                    indicators['1h']['adx'],
-                    volatility,
-                    btc_data['1h_change'],
-                    btc_data['4h_change'],
-                    indicators['15m']['volume_ratio']
-                ])
+            self.cursor.execute('''
+                INSERT INTO ai_training_data (
+                    timestamp, current_price, rsi_15m, rsi_1h, macd_15m, 
+                    macd_hist_15m, adx_15m, adx_1h, volatility, 
+                    btc_1h_change, btc_4h_change, volume_ratio_15m
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                datetime.now().isoformat(),
+                current_price,
+                indicators['15m']['rsi'],
+                indicators['1h']['rsi'],
+                indicators['15m']['macd'],
+                indicators['15m']['macd_histogram'],
+                indicators['15m']['adx'],
+                indicators['1h']['adx'],
+                volatility,
+                btc_data['1h_change'],
+                btc_data['4h_change'],
+                indicators['15m']['volume_ratio']
+            ))
+            self.conn.commit()
         except Exception as e:
             print(f"⚠️ Error logging features: {e}")
 
@@ -235,28 +265,27 @@ class FuturesTradingBot:
         pos = futures_state['position']
         if not pos: return
         
-        file_exists = os.path.isfile('ai_trade_outcomes.csv')
         try:
-            with open('ai_trade_outcomes.csv', mode='a', newline='') as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(['entry_time', 'exit_time', 'direction', 'entry_price', 
-                                     'exit_price', 'pnl', 'max_favorable_price', 'max_adverse_price'])
+            entry_time = pos.get('timestamp')
+            if isinstance(entry_time, datetime):
+                entry_time = entry_time.isoformat()
                 
-                entry_time = pos.get('timestamp')
-                if isinstance(entry_time, datetime):
-                    entry_time = entry_time.isoformat()
-                    
-                writer.writerow([
-                    entry_time,
-                    datetime.now().isoformat(),
-                    pos['direction'],
-                    pos['entry'],
-                    exit_price or pos.get('target'),
-                    pnl or 0,
-                    pos.get('highest_price', pos['entry']),
-                    pos.get('lowest_price', pos['entry'])
-                ])
+            self.cursor.execute('''
+                INSERT INTO ai_trade_outcomes (
+                    entry_time, exit_time, direction, entry_price, 
+                    exit_price, pnl, max_favorable_price, max_adverse_price
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                entry_time,
+                datetime.now().isoformat(),
+                pos['direction'],
+                pos['entry'],
+                exit_price or pos.get('target'),
+                pnl or 0,
+                pos.get('highest_price', pos['entry']),
+                pos.get('lowest_price', pos['entry'])
+            ))
+            self.conn.commit()
         except Exception as e:
             print(f"⚠️ Error logging outcome: {e}")
         
@@ -943,15 +972,6 @@ class FuturesTradingBot:
             print("❌ BTC bearish - skipping futures LONG")
             signal["signal"] = None
         
-        # Display market analysis
-        print(f"\n📊 {symbol} Futures Analysis:")
-        print(f"💰 Current Price: ${current_price:.4f}")
-        print(f"📈 RSI (15m/1h/4h): {indicators['15m']['rsi']:.1f}/{indicators['1h']['rsi']:.1f}/{indicators['4h']['rsi']:.1f}")
-        print(f"🌊 24h Volatility: {volatility:.2%}")
-        print(f"💪 ADX Strength: {indicators['1h']['adx']:.1f}")
-        print(f"₿ BTC: 1h={btc_data['1h_change']:+.1f}%, 4h={btc_data['4h_change']:+.1f}%")
-        print(f"🚀 Signal: {signal['signal']} (Strength: {signal['strength']}/10)")
-        
         # Execute trades
         can_trade, trade_reason = self.can_trade()
         usdt_balance = self.get_usdt_balance()
@@ -960,6 +980,15 @@ class FuturesTradingBot:
         if indicators['1h']['adx'] < 20:
             can_trade = False
             trade_reason = f"Market is flat/ranging (1h ADX: {indicators['1h']['adx']:.1f} < 20.0)"
+        
+        # Display market analysis
+        print(f"\n📊 {symbol} Futures Analysis:")
+        print(f"💰 Current Price: ${current_price:.4f}")
+        print(f"📈 RSI (15m/1h/4h): {indicators['15m']['rsi']:.1f}/{indicators['1h']['rsi']:.1f}/{indicators['4h']['rsi']:.1f}")
+        print(f"🌊 24h Volatility: {volatility:.2%}")
+        print(f"💪 ADX Strength: {indicators['1h']['adx']:.1f}")
+        print(f"₿ BTC: 1h={btc_data['1h_change']:+.1f}%, 4h={btc_data['4h_change']:+.1f}%")
+        print(f"🚀 Signal: {signal['signal']} (Strength: {signal['strength']}/10)")
         
         if (signal["signal"] in ["LONG", "SHORT"] and 
             signal["strength"] >= signal_strength_threshold and 
