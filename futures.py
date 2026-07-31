@@ -820,6 +820,11 @@ class FuturesTradingBot:
         can_trade, trade_reason = self.can_trade()
         usdt_balance = self.get_usdt_balance()
         
+        # Regime Filter: Block trades if market is ranging/flat
+        if indicators['1h']['adx'] < 20:
+            can_trade = False
+            trade_reason = f"Market is flat/ranging (1h ADX: {indicators['1h']['adx']:.1f} < 20.0)"
+        
         if (signal["signal"] in ["LONG", "SHORT"] and 
             signal["strength"] >= signal_strength_threshold and 
             can_trade and 
