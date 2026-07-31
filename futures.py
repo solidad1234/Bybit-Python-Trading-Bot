@@ -14,7 +14,7 @@ from pybit.unified_trading import HTTP
 from dotenv import load_dotenv
 import os
 import json
-import csv
+import sqlite3
 
 # Load environment variables
 load_dotenv()
@@ -27,7 +27,7 @@ primary_timeframe = "15"   # Primary analysis
 higher_timeframe = "60"    # Trend confirmation
 
 # Futures Risk Management
-futures_risk_per_trade = 0.015  # 1.5% risk per futures trade (Institutional Risk)
+futures_risk_per_trade = 0.02  # 2% risk per futures trade
 max_leverage = 20.0            # Conservative max leverage
 min_reward_ratio = 3.0         # Minimum reward:risk ratio (3:1)
 min_volatility_threshold = 0.02
@@ -61,9 +61,103 @@ class FuturesTradingBot:
     
     def __init__(self):
         print(f"🚀 Initializing Futures Trading Bot...")
-        self.state_file = "futures_state.json"
-        self.load_state()
+        self.init_db()
+        self.load_position_state()
         self.initialize_balance()
+
+    def init_db(self):
+        """Initialize SQLite database for state persistence"""
+        self.conn = sqlite3.connect('trading_state.db', check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS position (
+                id INTEGER PRIMARY KEY,
+                direction TEXT,
+                size REAL,
+                entry REAL,
+                stop REAL,
+                target REAL,
+                leverage REAL,
+                margin REAL,
+                order_id TEXT,
+                timestamp TEXT,
+                exit_25_taken INTEGER,
+                exit_50_taken INTEGER,
+                stop_moved_to_be INTEGER,
+                original_stop REAL,
+                highest_price REAL,
+                lowest_price REAL
+            )
+        ''')
+        self.conn.commit()
+
+    def save_position_state(self):
+        """Save current position state to SQLite"""
+        if not futures_state['position']:
+            return
+            
+        pos = futures_state['position']
+        self.cursor.execute('DELETE FROM position')
+        self.cursor.execute('''
+            INSERT INTO position (
+                direction, size, entry, stop, target, leverage, margin,
+                order_id, timestamp, exit_25_taken, exit_50_taken,
+                stop_moved_to_be, original_stop, highest_price, lowest_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            pos['direction'], pos['size'], pos['entry'], pos['stop'],
+            pos['target'], pos['leverage'], pos['margin'], pos['order_id'],
+            str(pos['timestamp']), int(pos.get('exit_25_taken', False)), 
+            int(pos.get('exit_50_taken', False)), int(pos.get('stop_moved_to_be', False)),
+            pos.get('original_stop', pos['stop']), pos.get('highest_price', pos['entry']),
+            pos.get('lowest_price', pos['entry'])
+        ))
+        self.conn.commit()
+        
+    def load_position_state(self):
+        """Load active position from SQLite on startup"""
+        self.cursor.execute('SELECT * FROM position LIMIT 1')
+        row = self.cursor.fetchone()
+        if row:
+            print(f"🔄 Recovering active position from database...")
+            futures_state['position'] = {
+                'direction': row[1],
+                'size': row[2],
+                'entry': row[3],
+                'stop': row[4],
+                'target': row[5],
+                'leverage': row[6],
+                'margin': row[7],
+                'order_id': row[8],
+                'timestamp': row[9] if row[9] else datetime.now(),
+                'exit_25_taken': bool(row[10]),
+                'exit_50_taken': bool(row[11]),
+                'stop_moved_to_be': bool(row[12]),
+                'original_stop': row[13],
+                'highest_price': row[14],
+                'lowest_price': row[15]
+            }
+            # Verify with exchange (optional but safe)
+            try:
+                result = session.get_positions(category="linear", symbol=symbol)
+                if result.get("retCode") == 0:
+                    pos_list = result.get("result", {}).get("list", [])
+                    active_size = float(pos_list[0].get("size", "0")) if pos_list else 0
+                    if active_size == 0:
+                        print("⚠️ DB position found, but Bybit reports no open position. Clearing state.")
+                        self.clear_position_state()
+                    else:
+                        print(f"✅ Bybit confirmed open position of size {active_size}.")
+            except Exception as e:
+                print(f"⚠️ Could not verify position with Bybit: {e}")
+        else:
+            futures_state['position'] = None
+
+    def clear_position_state(self):
+        """Clear position from SQLite"""
+        self.cursor.execute('DELETE FROM position')
+        self.conn.commit()
+        futures_state['position'] = None
         
     def save_state(self):
         """Save critical state to disk"""
@@ -602,6 +696,8 @@ class FuturesTradingBot:
                     'lowest_price': current_price    # For SHORT positions
                 }
                 
+                self.save_position_state()
+                
                 futures_state['daily_trades'] += 1
                 futures_state['total_trades'] += 1
                 self.save_state()
@@ -674,9 +770,9 @@ class FuturesTradingBot:
                     symbol=symbol,
                     stopLoss=str(round(new_stop, 2))
                 )
-                self.save_state()
-            except:
-                pass
+                self.save_position_state()
+            except Exception as e:
+                print(f"⚠️ Error setting trailing stop: {e}")
         
         # Check exit conditions
         if direction == "LONG":
@@ -710,6 +806,7 @@ class FuturesTradingBot:
             if 'lowest_price' not in position or current_price < position['lowest_price']:
                 position['lowest_price'] = current_price
                 print(f"📉 New best SHORT price: ${current_price:.2f}")
+                self.save_position_state()
 
             best_price = position['lowest_price']
             unrealized_pnl_pct = (entry_price - best_price) / entry_price
@@ -728,6 +825,7 @@ class FuturesTradingBot:
             if 'highest_price' not in position or current_price > position['highest_price']:
                 position['highest_price'] = current_price
                 print(f"📈 New best LONG price: ${current_price:.2f}")
+                self.save_position_state()
 
             best_price = position['highest_price']
             unrealized_pnl_pct = (best_price - entry_price) / entry_price
@@ -765,23 +863,20 @@ class FuturesTradingBot:
         if pnl_pct >= 0.02 and not position.get('exit_25_taken'):
             position['exit_25_taken'] = True
             print(f"💰 Taking 25% profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
-            changed = True
+            self.save_position_state()
         
         # Take another 25% at 4% gain
         if pnl_pct >= 0.04 and not position.get('exit_50_taken'):
             position['exit_50_taken'] = True
             print(f"💰 Taking 25% more profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
-            changed = True
+            self.save_position_state()
         
         # Move stop to breakeven after 50% taken
         if position.get('exit_50_taken') and not position.get('stop_moved_to_be'):
             position['stop'] = entry_price
             position['stop_moved_to_be'] = True
             print(f"🛡️ Stop moved to breakeven: ${entry_price:.2f}")
-            changed = True
-            
-        if changed:
-            self.save_state()
+            self.save_position_state()
     
     def close_position(self, result_type, log_already_done=False, exit_price=None):
         """Close futures position"""
@@ -801,8 +896,7 @@ class FuturesTradingBot:
         else:
             futures_state['consecutive_losses'] += 1
         
-        futures_state['position'] = None
-        self.save_state()
+        self.clear_position_state()
     
     def can_trade(self):
         """Check if trading is allowed"""
@@ -826,7 +920,7 @@ class FuturesTradingBot:
         data = self.fetch_multi_timeframe_data()
         if not data:
             print("❌ Failed to fetch market data")
-            return
+            return None
         
         # Calculate indicators
         print("🧮 Calculating technical indicators...")
@@ -862,6 +956,11 @@ class FuturesTradingBot:
         can_trade, trade_reason = self.can_trade()
         usdt_balance = self.get_usdt_balance()
         
+        # Regime Filter: Block trades if market is ranging/flat
+        if indicators['1h']['adx'] < 20:
+            can_trade = False
+            trade_reason = f"Market is flat/ranging (1h ADX: {indicators['1h']['adx']:.1f} < 20.0)"
+        
         if (signal["signal"] in ["LONG", "SHORT"] and 
             signal["strength"] >= signal_strength_threshold and 
             can_trade and 
@@ -884,62 +983,104 @@ class FuturesTradingBot:
         if futures_state['total_trades'] > 0:
             win_rate = futures_state['winning_trades'] / futures_state['total_trades'] * 100
             print(f"🎯 Win Rate: {win_rate:.1f}% ({futures_state['winning_trades']}/{futures_state['total_trades']})")
+            
+        return indicators
     
+    def get_current_price(self):
+        """Fast API call to get latest price for active position management"""
+        try:
+            result = session.get_tickers(category="linear", symbol=symbol)
+            if result.get("retCode") == 0:
+                list_data = result.get("result", {}).get("list", [])
+                if list_data:
+                    return float(list_data[0].get("lastPrice", "0"))
+        except Exception as e:
+            pass
+        return None
+
     def run_bot(self):
         """Main bot execution loop"""
         
         print("🚀" + "="*80)
-        print("🚀 STANDALONE FUTURES TRADING BOT")
+        print("🚀 STANDALONE FUTURES TRADING BOT (FAST LOOP ENABLED)")
         print("🚀" + "="*80)
         print(f"💎 Symbol: {symbol}")
         print(f"⚡ Strategy: Pure Futures with BTC Correlation")
         print(f"📊 Risk Per Trade: {futures_risk_per_trade*100:.0f}% of USDT balance")
         print(f"⏰ Analysis Frequency: Every 5 minutes")
+        print(f"🚀 Execution Frequency: Every 10 seconds (Price check & trailing stops)")
+        print(f"💾 Storage: SQLite3 State Persistence")
         print(f"🎯 Signal Threshold: {signal_strength_threshold}/10")
         print(f"💰 Max Leverage: {max_leverage:.1f}x")
         print(f"🎯 Reward Ratio: {min_reward_ratio:.1f}:1 minimum")
-        print(f"🛡️ Enhanced: Wider stops (2.5x ATR), trailing stops, partial exits")
         print("="*80)
         
         cycle_count = 0
+        last_analysis_time = 0
+        analysis_interval = 300  # 5 minutes
+        indicators_cache = None
+        
+        # If we restarted with a position, try to get initial indicators for trailing stop math
+        if futures_state['position']:
+            print("🔄 Initializing indicators for active position management...")
+            data = self.fetch_multi_timeframe_data()
+            if data:
+                indicators_cache, _, _ = self.calculate_indicators(data)
         
         while True:
             try:
-                cycle_count += 1
+                current_time = time.time()
                 
-                self.run_futures_strategy()
+                # --- FAST LOOP: Active Position Management (Every 10 seconds) ---
+                if futures_state['position']:
+                    fast_price = self.get_current_price()
+                    if fast_price and indicators_cache:
+                        self.check_position_exits(fast_price, indicators_cache)
                 
-                # Reset daily counters at midnight
-                if datetime.now().hour == 0 and datetime.now().minute < 5:
-                    futures_state['daily_trades'] = 0
-                    print("🌅 Daily trading counter reset")
+                # --- SLOW LOOP: Market Analysis & Signals (Every 5 minutes) ---
+                if current_time - last_analysis_time >= analysis_interval:
+                    cycle_count += 1
+                    
+                    indicators = self.run_futures_strategy()
+                    if indicators:
+                        indicators_cache = indicators
+                    
+                    # Reset daily counters at midnight
+                    if datetime.now().hour == 0 and datetime.now().minute < 5:
+                        futures_state['daily_trades'] = 0
+                        print("🌅 Daily trading counter reset")
+                    
+                    # Update balance periodically
+                    if cycle_count % 12 == 0:  # Every hour (12 * 5 mins)
+                        futures_state['available_balance'] = self.get_usdt_balance()
+                    
+                    # Session statistics
+                    runtime = datetime.now() - futures_state['session_start']
+                    print(f"\n📊 Session Stats:")
+                    print(f"⏰ Runtime: {runtime}")
+                    print(f"🔄 Analysis Cycles: {cycle_count}")
+                    print(f"💼 Total Trades: {futures_state['total_trades']}")
+                    print(f"💰 Current Balance: ${futures_state['available_balance']:.2f}")
+                    
+                    next_cycle = datetime.now() + timedelta(minutes=5)
+                    print(f"\n💤 Next analysis at {next_cycle.strftime('%H:%M:%S')} (Checking stops every 10s)")
+                    print("="*80)
+                    
+                    last_analysis_time = time.time()
                 
-                # Update balance periodically
-                if cycle_count % 12 == 0:  # Every hour
-                    futures_state['available_balance'] = self.get_usdt_balance()
-                
-                # Session statistics
-                runtime = datetime.now() - futures_state['session_start']
-                print(f"\n📊 Session Stats:")
-                print(f"⏰ Runtime: {runtime}")
-                print(f"🔄 Cycles: {cycle_count}")
-                print(f"💼 Total Trades: {futures_state['total_trades']}")
-                print(f"💰 Current Balance: ${futures_state['available_balance']:.2f}")
-                
-                next_cycle = datetime.now() + timedelta(minutes=5)
-                print(f"\n💤 Next cycle at {next_cycle.strftime('%H:%M:%S')}")
-                print("="*80)
-                
-                time.sleep(300)  # 5 minutes
+                # Short sleep for fast reaction time
+                time.sleep(10)
                 
             except KeyboardInterrupt:
                 print("\n🛑 Futures bot stopped by user")
                 print(f"📊 Final Stats: {futures_state['total_trades']} trades, {cycle_count} cycles")
+                if hasattr(self, 'conn'):
+                    self.conn.close()
                 break
             except Exception as e:
                 print(f"❌ Error: {e}")
-                print("⏰ Waiting 2 minutes before retry...")
-                time.sleep(120)
+                print("⏰ Waiting 30 seconds before retry...")
+                time.sleep(30)
 
 if __name__ == "__main__":
     bot = FuturesTradingBot()
