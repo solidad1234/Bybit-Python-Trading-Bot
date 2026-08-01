@@ -504,9 +504,8 @@ class FuturesTradingBot:
         # Calculate position size based on available margin
         max_position_by_margin = (max_usable_margin * leverage) / entry_price
         
-        # Calculate position size based on risk
-        base_position_size = risk_amount / stop_distance
-        max_position_by_risk = base_position_size * leverage
+        # Calculate position size based on risk (DO NOT multiply by leverage)
+        max_position_by_risk = risk_amount / stop_distance
         
         # Use the smaller of the two for safety
         position_size = min(max_position_by_margin, max_position_by_risk)
@@ -573,9 +572,9 @@ class FuturesTradingBot:
         print(f"   Using Primary ATR: ${primary_atr:.2f}")
         
         if direction == "SHORT":
-            base_stop_distance = 2.5 * primary_atr
-            strength_multiplier = 1.0 + (signal_strength / 15)
-            volatility_factor = min(atr_1h / atr_15m, 1.8) if atr_15m > 0 else 1.2
+            base_stop_distance = 1.5 * primary_atr
+            strength_multiplier = 1.0 + (signal_strength / 20)
+            volatility_factor = min(atr_1h / atr_15m, 1.5) if atr_15m > 0 else 1.2
             
             stop_distance = base_stop_distance * strength_multiplier * volatility_factor
             stop_loss = current_price + stop_distance
@@ -584,9 +583,9 @@ class FuturesTradingBot:
             take_profit = current_price - reward_distance
             
         else:  # LONG
-            base_stop_distance = 2.5 * primary_atr
-            strength_multiplier = 1.0 + (signal_strength / 15)
-            volatility_factor = min(atr_1h / atr_15m, 1.8) if atr_15m > 0 else 1.2
+            base_stop_distance = 1.5 * primary_atr
+            strength_multiplier = 1.0 + (signal_strength / 20)
+            volatility_factor = min(atr_1h / atr_15m, 1.5) if atr_15m > 0 else 1.2
             
             stop_distance = base_stop_distance * strength_multiplier * volatility_factor
             stop_loss = current_price - stop_distance
@@ -840,9 +839,9 @@ class FuturesTradingBot:
             best_price = position['lowest_price']
             unrealized_pnl_pct = (entry_price - best_price) / entry_price
 
-            if unrealized_pnl_pct > 0.02:  # at least 2% profit
+            if unrealized_pnl_pct > 0.015:  # at least 1.5% profit
                 # Place stop just above best price with ATR buffer
-                proposed_stop = best_price + (1.0 * atr_15m)
+                proposed_stop = best_price + (1.5 * atr_15m)
 
                 # Only update if better (lower than before)
                 if proposed_stop < current_stop:
@@ -859,9 +858,9 @@ class FuturesTradingBot:
             best_price = position['highest_price']
             unrealized_pnl_pct = (best_price - entry_price) / entry_price
 
-            if unrealized_pnl_pct > 0.02:  # at least 2% profit
+            if unrealized_pnl_pct > 0.015:  # at least 1.5% profit
                 # Place stop just below best price with ATR buffer
-                proposed_stop = best_price - (1.0 * atr_15m)
+                proposed_stop = best_price - (1.5 * atr_15m)
 
                 # Only update if better (higher than before)
                 if proposed_stop > current_stop:
@@ -888,20 +887,20 @@ class FuturesTradingBot:
             pnl_pct = (current_price - entry_price) / entry_price
         
         changed = False
-        # Take 25% profit at 2% gain
-        if pnl_pct >= 0.02 and not position.get('exit_25_taken'):
+        # Take 25% profit at 1.5% gain
+        if pnl_pct >= 0.015 and not position.get('exit_25_taken'):
             position['exit_25_taken'] = True
             print(f"💰 Taking 25% profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
             self.save_position_state()
         
-        # Take another 25% at 4% gain
-        if pnl_pct >= 0.04 and not position.get('exit_50_taken'):
+        # Take another 25% at 3% gain
+        if pnl_pct >= 0.03 and not position.get('exit_50_taken'):
             position['exit_50_taken'] = True
             print(f"💰 Taking 25% more profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
             self.save_position_state()
         
-        # Move stop to breakeven after 50% taken
-        if position.get('exit_50_taken') and not position.get('stop_moved_to_be'):
+        # Move stop to breakeven after 25% taken (1.5% gain)
+        if position.get('exit_25_taken') and not position.get('stop_moved_to_be'):
             position['stop'] = entry_price
             position['stop_moved_to_be'] = True
             print(f"🛡️ Stop moved to breakeven: ${entry_price:.2f}")
