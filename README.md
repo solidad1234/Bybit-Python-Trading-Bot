@@ -6,15 +6,19 @@ A high-performance algorithmic trading bot built for Bybit, utilizing technical 
 
 - **Technical Market Analysis**: Uses the `TA-LIB` library for precise calculations.
 - **Indicators Used**: RSI, MACD, Moving Averages (MA, EMA, SMA), ATR, Bollinger Bands, and Stochastic RSI based on multi-timeframe Kline data (15m, 1h, 4h).
+- **Multi-Factor Regime Gate (V2 Engine)**: Incorporates macro regime filtering, derivatives flow (Funding rates, Open Interest), and sentiment analysis to filter out false TA signals.
+- **Dynamic Asset Scanning**: Concurrently scans a robust universe of high-liquidity assets (SOL, ETH, AVAX, LINK, BNB) to execute the highest-probability setup instead of relying on a single pair.
 - **BTC Trend Filter**: Monitors Bitcoin's momentum to filter out false signals in altcoin pairs.
 - **Advanced Risk Management**: 
+  - **Dynamic Thresholding**: Elevates the evidentiary threshold for LONG setups during highly bearish macroeconomic regimes.
+  - **Early Scratch Exit**: Immediately cuts positions (-0.7%) if they move adversely within the first 45 minutes, significantly improving R-multiples by capping rapid dumps.
   - Uses Average True Range (ATR) to dynamically calculate realistic Stop Loss and Take Profit levels.
   - Implements trailing stops based on real-time price action to lock in profits.
-  - Scales out of positions (25% take profits at 2% and 4% gains).
-- **Robust State Management**: Uses **SQLite3 (`trading_state.db`)** to persist open position data. If the bot disconnects or restarts, it will seamlessly recover the active trade and continue managing it without data loss.
+  - Scales out of positions (25% take profits at 2% and 3.5% gains).
+- **Robust State Management**: Uses **SQLite3 (`trading_state.db`)** to persist open position data and rich multi-factor trade logs.
 - **Dual Execution Loop**: 
-  - **Fast Loop (Every 10s)**: Rapidly queries current price tickers to manage open positions, trigger trailing stops, and execute partial take-profits instantly.
-  - **Slow Loop (Every 5m)**: Runs heavier technical analysis (TA-LIB) calculations to detect new trade entries on candle closes.
+  - **Fast Loop (Every 10s)**: Rapidly queries current price tickers to manage open positions, trigger early scratch exits, trailing stops, and partial take-profits.
+  - **Slow Loop (Every 5m)**: Scans the multi-asset universe and calculates technical + multi-factor consensus.
 
 ## Setup
 
@@ -49,11 +53,12 @@ This repository contains **three automated crypto trading bots** for **Bybit**, 
 - **Risk**: No liquidation risk, conservative approach
 - **Best for**: Bull markets and trending conditions
 
-### 2. **Futures Trading Bot** (`futures.py`) 
-- **Strategy**: Leveraged perpetual contracts
-- **Direction**: Both LONG and SHORT positions
-- **Risk**: Higher risk due to leverage, liquidation possible
-- **Best for**: Volatile markets and experienced traders
+### 2. **Futures Trading Bot** (`futures.py` - V2 Engine) 
+- **Strategy**: Leveraged perpetual contracts utilizing multi-asset scanning.
+- **Assets**: Dynamically scans SOL, ETH, AVAX, LINK, BNB for the best setup.
+- **Direction**: Both LONG and SHORT positions (Max 1 Open Position at a time).
+- **Risk**: Dynamic risk management with Early Scratch Exits and Regime-based thresholds.
+- **Best for**: Trading high-conviction macro-aligned setups across top altcoins.
 
 ### 3. **🌟 Hybrid Trading Bot** (`hybrid.py`) - **RECOMMENDED**
 - **Strategy**: Combines spot + futures for maximum opportunities
