@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 import os
 import json
 import sqlite3
+from factors.aggregator import MultiFactorAggregator
 
 # Load environment variables
 load_dotenv()
@@ -22,14 +23,14 @@ api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
 # Trading Configuration
-symbol = "SOLUSDT"
+TRADE_SYMBOLS = ["SOLUSDT", "ETHUSDT", "AVAXUSDT", "LINKUSDT", "BNBUSDT"]
 primary_timeframe = "15"   # Primary analysis
 higher_timeframe = "60"    # Trend confirmation
 
 # Futures Risk Management
 futures_risk_per_trade = 0.02  # 2% risk per futures trade
 max_leverage = 20.0            # Conservative max leverage
-min_reward_ratio = 3.0         # Minimum reward:risk ratio (3:1)
+min_reward_ratio = 2.0         # 2:1 R:R — achievable on 15m; 3:1 target was never reached in backtesting
 min_volatility_threshold = 0.02
 
 # Trading Limits
@@ -76,6 +77,7 @@ class FuturesTradingBot:
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS position (
                 id INTEGER PRIMARY KEY,
+                symbol TEXT,
                 direction TEXT,
                 size REAL,
                 entry REAL,
@@ -123,6 +125,46 @@ class FuturesTradingBot:
                 max_adverse_price REAL
             )
         ''')
+        # ── Rich trade log — all factor context saved at entry ──────────
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trade_log (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol             TEXT,
+                entry_time         TEXT,
+                exit_time          TEXT,
+                direction          TEXT,
+                entry_price        REAL,
+                exit_price         REAL,
+                size               REAL,
+                pnl                REAL,
+                result             TEXT,
+
+                -- Signal quality
+                ta_signal_strength REAL,
+                aggregated_score   REAL,
+                volatility         REAL,
+                atr_15m            REAL,
+
+                -- Multi-factor scores (−1 → +1)
+                technical_score    REAL,
+                regime_score       REAL,
+                derivatives_score  REAL,
+                sentiment_score    REAL,
+                news_score         REAL,
+
+                -- Regime classification
+                regime_class       TEXT,
+
+                -- Derivatives snapshot at entry
+                funding_rate       REAL,
+                open_interest      REAL,
+                long_short_ratio   REAL,
+
+                -- News & trend context
+                news_sentiment     TEXT,
+                market_trend_4h    TEXT
+            )
+        ''')
         self.conn.commit()
 
     def save_position_state(self):
@@ -134,12 +176,12 @@ class FuturesTradingBot:
         self.cursor.execute('DELETE FROM position')
         self.cursor.execute('''
             INSERT INTO position (
-                direction, size, entry, stop, target, leverage, margin,
+                symbol, direction, size, entry, stop, target, leverage, margin,
                 order_id, timestamp, exit_25_taken, exit_50_taken,
                 stop_moved_to_be, original_stop, highest_price, lowest_price
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            pos['direction'], pos['size'], pos['entry'], pos['stop'],
+            pos['symbol'], pos['direction'], pos['size'], pos['entry'], pos['stop'],
             pos['target'], pos['leverage'], pos['margin'], pos['order_id'],
             str(pos['timestamp']), int(pos.get('exit_25_taken', False)), 
             int(pos.get('exit_50_taken', False)), int(pos.get('stop_moved_to_be', False)),
@@ -155,25 +197,26 @@ class FuturesTradingBot:
         if row:
             print(f"🔄 Recovering active position from database...")
             futures_state['position'] = {
-                'direction': row[1],
-                'size': row[2],
-                'entry': row[3],
-                'stop': row[4],
-                'target': row[5],
-                'leverage': row[6],
-                'margin': row[7],
-                'order_id': row[8],
-                'timestamp': row[9] if row[9] else datetime.now(),
-                'exit_25_taken': bool(row[10]),
-                'exit_50_taken': bool(row[11]),
-                'stop_moved_to_be': bool(row[12]),
-                'original_stop': row[13],
-                'highest_price': row[14],
-                'lowest_price': row[15]
+                'symbol': row[1] if row[1] else TRADE_SYMBOLS[0],  # fallback for legacy rows
+                'direction': row[2],
+                'size': row[3],
+                'entry': row[4],
+                'stop': row[5],
+                'target': row[6],
+                'leverage': row[7],
+                'margin': row[8],
+                'order_id': row[9],
+                'timestamp': row[10] if row[10] else datetime.now(),
+                'exit_25_taken': bool(row[11]),
+                'exit_50_taken': bool(row[12]),
+                'stop_moved_to_be': bool(row[13]),
+                'original_stop': row[14],
+                'highest_price': row[15],
+                'lowest_price': row[16]
             }
             # Verify with exchange (optional but safe)
             try:
-                result = session.get_positions(category="linear", symbol=symbol)
+                result = session.get_positions(category="linear", symbol=futures_state['position']['symbol'])
                 if result.get("retCode") == 0:
                     pos_list = result.get("result", {}).get("list", [])
                     active_size = float(pos_list[0].get("size", "0")) if pos_list else 0
@@ -263,32 +306,83 @@ class FuturesTradingBot:
         except Exception as e:
             print(f"⚠️ Error logging features: {e}")
 
-    def log_trade_outcome(self, pnl=None, exit_price=None):
-        """Log outcome for AI training"""
+    def log_trade_outcome(self, pnl=None, exit_price=None, result=None,
+                          exit_time=None, factor_context=None):
+        """
+        Log trade outcome to BOTH ai_trade_outcomes (legacy) and the new
+        trade_log table which includes all multi-factor context.
+
+        factor_context dict (all keys optional):
+            ta_signal_strength, aggregated_score, volatility, atr_15m,
+            technical_score, regime_score, derivatives_score, sentiment_score,
+            news_score, regime_class,
+            funding_rate, open_interest, long_short_ratio,
+            news_sentiment, market_trend_4h
+        """
         pos = futures_state['position']
         if not pos: return
-        
+
+        fc = factor_context or {}
         try:
             entry_time = pos.get('timestamp')
             if isinstance(entry_time, datetime):
                 entry_time = entry_time.isoformat()
-                
+            now_str = (exit_time or datetime.now()).isoformat() if not isinstance(
+                exit_time, str) else exit_time
+
+            # ── legacy table (unchanged) ───────────────────────────────
             self.cursor.execute('''
                 INSERT INTO ai_trade_outcomes (
-                    entry_time, exit_time, direction, entry_price, 
+                    entry_time, exit_time, direction, entry_price,
                     exit_price, pnl, max_favorable_price, max_adverse_price
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                entry_time,
-                datetime.now().isoformat(),
-                pos['direction'],
-                pos['entry'],
-                exit_price or pos.get('target'),
-                pnl or 0,
+                entry_time, now_str, pos['direction'], pos['entry'],
+                exit_price or pos.get('target'), pnl or 0,
                 pos.get('highest_price', pos['entry']),
                 pos.get('lowest_price', pos['entry'])
             ))
+
+            # ── rich trade_log table ────────────────────────────────────
+            self.cursor.execute('''
+                INSERT INTO trade_log (
+                    symbol, entry_time, exit_time, direction, entry_price, exit_price,
+                    size, pnl, result,
+                    ta_signal_strength, aggregated_score, volatility, atr_15m,
+                    technical_score, regime_score, derivatives_score,
+                    sentiment_score, news_score, regime_class,
+                    funding_rate, open_interest, long_short_ratio,
+                    news_sentiment, market_trend_4h
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ''', (
+                pos.get('symbol', 'UNKNOWN'),
+                entry_time,
+                now_str,
+                pos['direction'],
+                pos['entry'],
+                exit_price or pos.get('target'),
+                pos.get('size', 0),
+                pnl or 0,
+                result or 'UNKNOWN',
+                fc.get('ta_signal_strength'),
+                fc.get('aggregated_score'),
+                fc.get('volatility'),
+                fc.get('atr_15m'),
+                fc.get('technical_score'),
+                fc.get('regime_score'),
+                fc.get('derivatives_score'),
+                fc.get('sentiment_score'),
+                fc.get('news_score'),
+                fc.get('regime_class'),
+                fc.get('funding_rate'),
+                fc.get('open_interest'),
+                fc.get('long_short_ratio'),
+                fc.get('news_sentiment'),
+                fc.get('market_trend_4h'),
+            ))
+
             self.conn.commit()
+            print(f"✅ Trade logged — PnL: ${pnl:.2f}  Result: {result}")
         except Exception as e:
             print(f"⚠️ Error logging outcome: {e}")
         
@@ -332,7 +426,7 @@ class FuturesTradingBot:
             print(f"❌ Error getting USDT balance: {e}")
             return 0.0
     
-    def fetch_multi_timeframe_data(self):
+    def fetch_multi_timeframe_data(self, symbol):
         """Fetch data from multiple timeframes"""
         data = {}
         
@@ -446,10 +540,30 @@ class FuturesTradingBot:
         
         return {'bullish': True, 'bearish': False, '1h_change': 0, '4h_change': 0}
     
-    def calculate_futures_signals(self, indicators, current_price, volatility):
-        """Calculate futures trading signals"""
-        
-        # Futures LONG conditions
+    def calculate_futures_signals(self, indicators, current_price, volatility, regime_score=0.0):
+        """
+        Calculate futures trading signals.
+
+        4h trend alignment is a HARD GATE (non-negotiable):
+          - LONG  only when 4h EMA_21 > EMA_50  (4h uptrend confirmed)
+          - SHORT only when 4h EMA_21 < EMA_50  (4h downtrend confirmed)
+        This prevents buying into sustained downtrends and shorting into uptrends,
+        which was the primary cause of losses identified during backtesting.
+        """
+        ind4h = indicators.get("4h", {})
+        ema21_4h = ind4h.get("ema_21", None)
+        ema50_4h = ind4h.get("ema_50", None)
+
+        # Hard trend gates — fall back to allowing both if 4h data unavailable
+        if ema21_4h is not None and ema50_4h is not None and ema50_4h > 0:
+            trend_bullish = ema21_4h > ema50_4h   # 4h uptrend
+            trend_bearish = ema21_4h < ema50_4h   # 4h downtrend
+        else:
+            print("⚠️  4h EMA unavailable — trend gate relaxed for this cycle")
+            trend_bullish = True
+            trend_bearish = True
+
+        # Futures LONG conditions (7 conditions, need 5+)
         futures_long_conditions = [
             indicators["15m"]["rsi"] < 40,
             indicators["1h"]["rsi"] < 50,
@@ -457,10 +571,10 @@ class FuturesTradingBot:
             current_price > indicators["15m"]["ema_21"] * 0.998,
             indicators["15m"]["volume_ratio"] > 1.3,
             volatility > 0.02,
-            indicators["15m"]["adx"] > 20
+            indicators["15m"]["adx"] > 18,
         ]
-        
-        # Futures SHORT conditions
+
+        # Futures SHORT conditions (10 conditions, need 6+)
         futures_short_conditions = [
             indicators["15m"]["rsi"] > 65,
             indicators["1h"]["rsi"] > 55,
@@ -471,17 +585,32 @@ class FuturesTradingBot:
             volatility > 0.025,
             indicators["15m"]["stoch_k"] > 80,
             current_price > indicators["1h"]["ema_50"] * 0.98,
-            indicators["15m"]["adx"] > 18
+            indicators["15m"]["adx"] > 18,
         ]
-        
-        long_score = sum(futures_long_conditions)
+
+        long_score  = sum(futures_long_conditions)
         short_score = sum(futures_short_conditions)
-        
-        if long_score >= 5:
-            return {"signal": "LONG", "strength": long_score, "leverage": 10.0}
-        elif short_score >= 6:
+
+        # Dynamic LONG threshold: require more evidence during bearish macro regime
+        min_long_score = 6 if regime_score <= -0.4 else 5
+
+        # Log 4h trend context
+        trend_label = "BULL" if trend_bullish else ("BEAR" if trend_bearish else "FLAT")
+        print(f"   4h Trend: {trend_label}  (EMA21={ema21_4h:.2f} {'>' if trend_bullish else '<'} EMA50={ema50_4h:.2f})" if ema21_4h else "   4h Trend: UNKNOWN")
+        print(f"   LONG score={long_score}/7 (min {min_long_score})  SHORT score={short_score}/10")
+
+        # Hard gate: TA signal is only valid when 4h trend aligns
+        if long_score >= min_long_score and trend_bullish:
+            return {"signal": "LONG",  "strength": long_score,  "leverage": 10.0}
+        if short_score >= 6 and trend_bearish:
             return {"signal": "SHORT", "strength": short_score, "leverage": 10.5}
-        
+
+        # Log why signal was blocked
+        if long_score >= min_long_score and not trend_bullish:
+            print(f"   🚫 LONG blocked — 4h trend is bearish (EMA21 < EMA50)")
+        if short_score >= 6 and not trend_bearish:
+            print(f"   🚫 SHORT blocked — 4h trend is bullish (EMA21 > EMA50)")
+
         return {"signal": None, "strength": max(long_score, short_score)}
     
     def calculate_futures_position_size(self, entry_price, stop_loss_price, leverage=10.0):
@@ -622,8 +751,11 @@ class FuturesTradingBot:
             'primary_atr_used': primary_atr
         }
     
-    def place_futures_order(self, signal, current_price, indicators):
-        """Place futures order with improved stops"""
+    def place_futures_order(self, signal, current_price, indicators, factor_context=None, symbol_override=None):
+        """Place futures order with improved stops. factor_context holds all
+        multi-factor scores collected at signal time for logging."""
+        
+        trade_sym = symbol_override if symbol_override else TRADE_SYMBOLS[0]
         
         # Calculate improved stops
         stop_data = self.calculate_improved_futures_stops(
@@ -656,7 +788,7 @@ class FuturesTradingBot:
             try:
                 leverage_result = session.set_leverage(
                     category="linear",
-                    symbol=symbol,
+                    symbol=trade_sym,
                     buyLeverage=str(int(signal["leverage"])),
                     sellLeverage=str(int(signal["leverage"]))
                 )
@@ -676,7 +808,7 @@ class FuturesTradingBot:
             side = "Buy" if signal["signal"] == "LONG" else "Sell"
             order_params = {
                 "category": "linear",
-                "symbol": symbol,
+                "symbol": trade_sym,
                 "side": side,
                 "orderType": "Market",
                 "qty": f"{position_data['position_size']:.1f}",
@@ -702,6 +834,7 @@ class FuturesTradingBot:
                 
                 # Store position
                 futures_state['position'] = {
+                    'symbol': trade_sym,
                     'direction': signal['signal'],
                     'size': position_data['position_size'],
                     'entry': current_price,
@@ -716,8 +849,10 @@ class FuturesTradingBot:
                     'stop_moved_to_be': False,
                     'original_stop': stop_loss,
                     # Track best price for trailing stop
-                    'highest_price': current_price,  # For LONG positions
-                    'lowest_price': current_price    # For SHORT positions
+                    'highest_price': current_price,
+                    'lowest_price': current_price,
+                    # Factor context logged at entry — persisted on close
+                    'factor_context': factor_context or {},
                 }
                 
                 self.save_position_state()
@@ -742,7 +877,7 @@ class FuturesTradingBot:
         try:
             result = session.get_positions(
                 category="linear",
-                symbol=symbol
+                symbol=futures_state['position']['symbol']
             )
             if result.get("retCode") == 0:
                 positions = result.get("result", {}).get("list", [])
@@ -753,7 +888,7 @@ class FuturesTradingBot:
                     # Get closed PnL to determine if win or loss
                     pnl_result = session.get_closed_pnl(
                         category="linear",
-                        symbol=symbol,
+                        symbol=futures_state['position']['symbol'],
                         limit=1
                     )
                     win = False
@@ -765,7 +900,8 @@ class FuturesTradingBot:
                             win = pnl > 0
                     
                     print(f"🔄 Sync: Position closed externally. PnL: {pnl:.2f}")
-                    self.log_trade_outcome(pnl=pnl)
+                    fc = futures_state['position'].get('factor_context', {})
+                    self.log_trade_outcome(pnl=pnl, result='WIN' if win else 'LOSS', factor_context=fc)
                     self.close_position("WIN" if win else "LOSS", log_already_done=True)
         except Exception as e:
             print(f"❌ Error syncing position: {e}")
@@ -791,14 +927,29 @@ class FuturesTradingBot:
             try:
                 session.set_trading_stop(
                     category="linear",
-                    symbol=symbol,
+                    symbol=pos['symbol'],
                     stopLoss=str(round(new_stop, 2))
                 )
                 self.save_position_state()
             except Exception as e:
                 print(f"⚠️ Error setting trailing stop: {e}")
         
-        # Check exit conditions
+        # -- Early Scratch Exit --
+        # If position goes adverse by -0.7% within first 45 minutes and stop hasn't
+        # been moved to breakeven, cut the loss immediately.
+        time_held_secs = (datetime.now() - pos['timestamp']).total_seconds()
+        if not pos.get('stop_moved_to_be') and time_held_secs <= 2700:
+            if direction == "LONG":
+                adverse_pct = (pos['entry'] - current_price) / pos['entry']
+            else:
+                adverse_pct = (current_price - pos['entry']) / pos['entry']
+                
+            if adverse_pct >= 0.007:
+                print(f"🔪 EARLY SCRATCH: Trade went adverse -0.7% quickly. Cutting losses at ${current_price:.2f}")
+                self.close_position("SCRATCH", exit_price=current_price)
+                return
+
+        # Check structural exit conditions
         if direction == "LONG":
             if current_price <= pos['stop']:
                 print(f"🛑 STOP LOSS hit at ${current_price:.2f}")
@@ -835,7 +986,7 @@ class FuturesTradingBot:
             best_price = position['lowest_price']
             unrealized_pnl_pct = (entry_price - best_price) / entry_price
 
-            if unrealized_pnl_pct > 0.015:  # at least 1.5% profit
+            if unrealized_pnl_pct > 0.03:  # raised from 1.5% — avoids stop at breakeven converting winners
                 # Place stop just above best price with ATR buffer
                 proposed_stop = best_price + (1.5 * atr_15m)
 
@@ -854,7 +1005,7 @@ class FuturesTradingBot:
             best_price = position['highest_price']
             unrealized_pnl_pct = (best_price - entry_price) / entry_price
 
-            if unrealized_pnl_pct > 0.015:  # at least 1.5% profit
+            if unrealized_pnl_pct > 0.03:  # raised from 1.5% — avoids stop at breakeven converting winners
                 # Place stop just below best price with ATR buffer
                 proposed_stop = best_price - (1.5 * atr_15m)
 
@@ -875,7 +1026,7 @@ class FuturesTradingBot:
             close_side = "Sell" if direction == "LONG" else "Buy"
             result = session.place_order(
                 category="linear",
-                symbol=symbol,
+                symbol=futures_state['position']['symbol'],
                 side=close_side,
                 orderType="Market",
                 qty=str(round(qty, 1)),
@@ -905,8 +1056,8 @@ class FuturesTradingBot:
         else:  # LONG
             pnl_pct = (current_price - entry_price) / entry_price
         
-        # Take 25% profit at 1.5% gain
-        if pnl_pct >= 0.015 and not position.get('exit_25_taken'):
+        # Take 25% profit at 2% gain (halfway to the 2:1 target)
+        if pnl_pct >= 0.02 and not position.get('exit_25_taken'):
             partial_qty = round(position['size'] * 0.25, 1)
             if partial_qty < 0.1:
                 partial_qty = 0.1  # Bybit minimum
@@ -917,8 +1068,8 @@ class FuturesTradingBot:
                 print(f"✅ 25% partial closed — remaining size: {position['size']:.1f} SOL")
                 self.save_position_state()
         
-        # Take another 25% at 3% gain
-        if pnl_pct >= 0.03 and not position.get('exit_50_taken'):
+        # Take another 25% at 3.5% gain (just before the 2:1 TP at ~4%)
+        if pnl_pct >= 0.035 and not position.get('exit_50_taken'):
             partial_qty = round(position['size'] * 0.25, 1)
             if partial_qty < 0.1:
                 partial_qty = 0.1
@@ -937,7 +1088,7 @@ class FuturesTradingBot:
             try:
                 session.set_trading_stop(
                     category="linear",
-                    symbol=symbol,
+                    symbol=position['symbol'],
                     stopLoss=str(round(entry_price, 2)),
                 )
             except Exception as e:
@@ -963,7 +1114,12 @@ class FuturesTradingBot:
                 print(f"ℹ️ Close order rejected — position likely already closed by exchange SL/TP")
         
         if not log_already_done:
-            self.log_trade_outcome(exit_price=exit_price)
+            fc = pos.get('factor_context', {})
+            self.log_trade_outcome(
+                exit_price=exit_price,
+                result=result_type,
+                factor_context=fc,
+            )
         
         # Update session P&L for circuit breaker
         if exit_price and pos.get('entry'):
@@ -1002,74 +1158,128 @@ class FuturesTradingBot:
         return True, "Can trade"
     
     def run_futures_strategy(self):
-        """Main futures strategy execution"""
+        """Main futures strategy execution (Multi-Asset Scanner)"""
         
         print(f"\n{'='*80}")
         print(f"🔄 FUTURES Analysis - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*80}")
         
-        # Fetch market data
-        print("📊 Fetching multi-timeframe data...")
-        data = self.fetch_multi_timeframe_data()
-        if not data:
-            print("❌ Failed to fetch market data")
-            return None
-        
-        # Calculate indicators
-        print("🧮 Calculating technical indicators...")
-        indicators, current_price, volatility = self.calculate_indicators(data)
-        
-        # Check BTC correlation
-        btc_data = self.check_btc_correlation()
-        
-        # Log features for AI Data Pipeline
-        self.log_features(current_price, indicators, btc_data, volatility)
-        
-        # Check position exits
-        self.check_position_exits(current_price, indicators)
-        
-        # Calculate futures signals
-        signal = self.calculate_futures_signals(indicators, current_price, volatility)
-        
-        # Apply BTC filter
-        if signal["signal"] == "LONG" and btc_data['bearish']:
-            print("❌ BTC bearish - skipping futures LONG")
-            signal["signal"] = None
-        
-        # Execute trades
         can_trade, trade_reason = self.can_trade()
         usdt_balance = self.get_usdt_balance()
-        
-        # Regime Filter: Block trades if market is ranging/flat
-        if indicators['1h']['adx'] < 20:
-            can_trade = False
-            trade_reason = f"Market is flat/ranging (1h ADX: {indicators['1h']['adx']:.1f} < 20.0)"
-        
-        # Display market analysis
-        print(f"\n📊 {symbol} Futures Analysis:")
-        print(f"💰 Current Price: ${current_price:.4f}")
-        print(f"📈 RSI (15m/1h/4h): {indicators['15m']['rsi']:.1f}/{indicators['1h']['rsi']:.1f}/{indicators['4h']['rsi']:.1f}")
-        print(f"🌊 24h Volatility: {volatility:.2%}")
-        print(f"💪 ADX Strength: {indicators['1h']['adx']:.1f}")
-        print(f"₿ BTC: 1h={btc_data['1h_change']:+.1f}%, 4h={btc_data['4h_change']:+.1f}%")
-        print(f"🚀 Signal: {signal['signal']} (Strength: {signal['strength']}/10)")
-        
-        if (signal["signal"] in ["LONG", "SHORT"] and 
-            signal["strength"] >= signal_strength_threshold and 
-            can_trade and 
-            not futures_state['position'] and
-            usdt_balance >= 5):
-            
-            print(f"\n🚀 FUTURES {signal['signal']} SIGNAL DETECTED!")
-            self.place_futures_order(signal, current_price, indicators)
-        elif signal["signal"] in ["LONG", "SHORT"] and usdt_balance < 5:
-            print(f"⚠️ Signal detected but insufficient USDT margin: ${usdt_balance:.2f}")
-        elif not can_trade:
+        futures_state['available_balance'] = usdt_balance
+
+        if not can_trade:
             print(f"⚠️ Trading blocked: {trade_reason}")
-        
+            return None
+        if usdt_balance < 5:
+            print(f"⚠️ Insufficient USDT margin: ${usdt_balance:.2f}")
+            return None
+        if futures_state['position']:
+            # We already have an open position. Do not scan new pairs.
+            # Active management is handled by the fast loop.
+            return None
+
+        best_setup = None
+        best_score = -1.0
+
+        print(f"🔍 Scanning Universe: {', '.join(TRADE_SYMBOLS)}")
+
+        for current_sym in TRADE_SYMBOLS:
+            print(f"\n📊 Analyzing {current_sym}...")
+            
+            data = self.fetch_multi_timeframe_data(current_sym)
+            if not data:
+                print(f"   ❌ Failed to fetch data")
+                continue
+            
+            indicators, current_price, volatility = self.calculate_indicators(data)
+            btc_data = self.check_btc_correlation()  # Uses global BTCUSDT
+            
+            # Regime Filter: Block if flat
+            if indicators['1h']['adx'] < 18:
+                print(f"   🚫 Flat market (1h ADX: {indicators['1h']['adx']:.1f} < 18)")
+                continue
+
+            aggregator = MultiFactorAggregator()
+            
+            # Get regime score directly for dynamic threshold
+            try:
+                from factors.regime import get_regime_score
+                regime_info = get_regime_score()
+                regime_score = regime_info.get("score", 0.0)
+            except:
+                regime_score = 0.0
+
+            signal = self.calculate_futures_signals(indicators, current_price, volatility, regime_score=regime_score)
+            
+            if signal["signal"] not in ["LONG", "SHORT"] or signal["strength"] < signal_strength_threshold:
+                continue
+
+            if signal["signal"] == "LONG" and btc_data['bearish']:
+                print("   ❌ BTC bearish - skipping LONG")
+                continue
+
+            # Full multi-factor evaluation
+            consensus = aggregator.evaluate(signal, current_sym, current_price)
+            if consensus["block_trade"] or consensus["signal"] is None:
+                continue
+
+            score_abs = abs(consensus["final_score"])
+            print(f"   ✅ {consensus['signal']} Passed! Score: {consensus['final_score']:+.3f}")
+
+            if score_abs > best_score:
+                best_score = score_abs
+                
+                scores    = consensus.get("factor_scores", {})
+                deriv_det = scores.get("derivatives", {}).get("details", {})
+                ind4h_now = indicators.get("4h", {})
+                trend_4h  = "BULL" if ind4h_now.get("ema_21", 0) > ind4h_now.get("ema_50", 0) else "BEAR"
+                
+                context = {
+                    "ta_signal_strength":  signal.get("strength"),
+                    "aggregated_score":    consensus.get("final_score"),
+                    "volatility":          volatility,
+                    "atr_15m":             indicators["15m"]["atr"],
+                    "technical_score":     scores.get("technical", {}).get("score"),
+                    "regime_score":        scores.get("regime",    {}).get("score"),
+                    "derivatives_score":   scores.get("derivatives", {}).get("score"),
+                    "sentiment_score":     scores.get("sentiment", {}).get("score"),
+                    "news_score":          scores.get("news",      {}).get("score"),
+                    "regime_class":        scores.get("regime", {}).get("details", {}).get("regime"),
+                    "funding_rate":        deriv_det.get("funding",        {}).get("current_rate_pct"),
+                    "open_interest":       deriv_det.get("open_interest",  {}).get("oi_change_pct"),
+                    "long_short_ratio":    deriv_det.get("long_short_ratio", {}).get("long_ratio_pct"),
+                    "news_sentiment":      scores.get("news", {}).get("details", {}).get("sentiment_label"),
+                    "market_trend_4h":     trend_4h,
+                }
+
+                best_setup = {
+                    "symbol": current_sym,
+                    "signal": consensus["signal"],
+                    "strength": signal["strength"],
+                    "leverage": signal["leverage"],
+                    "current_price": current_price,
+                    "indicators": indicators,
+                    "context": context
+                }
+
+        # ── Execute the Best Setup ──────────────────────────────────────────
+        if best_setup:
+            print(f"\n🏆 WINNING SETUP: {best_setup['signal']} on {best_setup['symbol']} (Score: {best_score:.3f})")
+            self.place_futures_order(
+                {"signal": best_setup["signal"], "strength": best_setup["strength"], "leverage": best_setup["leverage"]}, 
+                best_setup["current_price"], 
+                best_setup["indicators"], 
+                factor_context=best_setup["context"],
+                symbol_override=best_setup["symbol"]
+            )
+        else:
+            print("\n💤 No valid setups found across universe.")
+            
         # Display status
+        pos = futures_state['position']
         print(f"\n📊 Status:")
-        print(f"🚀 Position: {futures_state['position']['direction'] if futures_state['position'] else 'None'}")
+        print(f"🚀 Position: {pos['symbol'] + ' ' + pos['direction'] if pos else 'None'}")
         print(f"📈 Daily Trades: {futures_state['daily_trades']}/{max_daily_trades}")
         print(f"💰 Available Balance: ${futures_state['available_balance']:.2f}")
         
@@ -1079,7 +1289,7 @@ class FuturesTradingBot:
             
         return indicators
     
-    def get_current_price(self):
+    def get_current_price(self, symbol):
         """Fast API call to get latest price for active position management"""
         try:
             result = session.get_tickers(category="linear", symbol=symbol)
@@ -1118,7 +1328,7 @@ class FuturesTradingBot:
         # If we restarted with a position, try to get initial indicators for trailing stop math
         if futures_state['position']:
             print("🔄 Initializing indicators for active position management...")
-            data = self.fetch_multi_timeframe_data()
+            data = self.fetch_multi_timeframe_data(futures_state['position']['symbol'])
             if data:
                 indicators_cache, _, _ = self.calculate_indicators(data)
         
@@ -1128,7 +1338,7 @@ class FuturesTradingBot:
                 
                 # --- FAST LOOP: Active Position Management (Every 10 seconds) ---
                 if futures_state['position']:
-                    fast_price = self.get_current_price()
+                    fast_price = self.get_current_price(futures_state['position']['symbol'])
                     if fast_price and indicators_cache:
                         self.check_position_exits(fast_price, indicators_cache)
                 
