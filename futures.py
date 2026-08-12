@@ -939,7 +939,18 @@ class FuturesTradingBot:
         # -- Early Scratch Exit --
         # If position goes adverse by -0.7% within first 45 minutes and stop hasn't
         # been moved to breakeven, cut the loss immediately.
-        time_held_secs = (datetime.now() - pos['timestamp']).total_seconds()
+        
+        pos_time = pos['timestamp']
+        if isinstance(pos_time, str):
+            try:
+                # Handle ISO format string from DB
+                pos_time = datetime.fromisoformat(pos_time)
+            except Exception:
+                # Fallback if unparseable
+                pos_time = datetime.now()
+                
+        time_held_secs = (datetime.now() - pos_time).total_seconds()
+        
         if not pos.get('stop_moved_to_be') and time_held_secs <= 2700:
             if direction == "LONG":
                 adverse_pct = (pos['entry'] - current_price) / pos['entry']
