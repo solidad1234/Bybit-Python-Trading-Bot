@@ -195,24 +195,26 @@ class FuturesTradingBot:
         self.cursor.execute('SELECT * FROM position LIMIT 1')
         row = self.cursor.fetchone()
         if row:
+            columns = [col[0] for col in self.cursor.description]
+            row_dict = dict(zip(columns, row))
             print(f"🔄 Recovering active position from database...")
             futures_state['position'] = {
-                'symbol': row[1] if row[1] else TRADE_SYMBOLS[0],  # fallback for legacy rows
-                'direction': row[2],
-                'size': row[3],
-                'entry': row[4],
-                'stop': row[5],
-                'target': row[6],
-                'leverage': row[7],
-                'margin': row[8],
-                'order_id': row[9],
-                'timestamp': row[10] if row[10] else datetime.now(),
-                'exit_25_taken': bool(row[11]),
-                'exit_50_taken': bool(row[12]),
-                'stop_moved_to_be': bool(row[13]),
-                'original_stop': row[14],
-                'highest_price': row[15],
-                'lowest_price': row[16]
+                'symbol': row_dict.get('symbol') or TRADE_SYMBOLS[0],
+                'direction': row_dict.get('direction'),
+                'size': row_dict.get('size'),
+                'entry': row_dict.get('entry'),
+                'stop': row_dict.get('stop'),
+                'target': row_dict.get('target'),
+                'leverage': row_dict.get('leverage'),
+                'margin': row_dict.get('margin'),
+                'order_id': row_dict.get('order_id'),
+                'timestamp': row_dict.get('timestamp') or datetime.now(),
+                'exit_25_taken': bool(row_dict.get('exit_25_taken', False)),
+                'exit_50_taken': bool(row_dict.get('exit_50_taken', False)),
+                'stop_moved_to_be': bool(row_dict.get('stop_moved_to_be', False)),
+                'original_stop': row_dict.get('original_stop'),
+                'highest_price': row_dict.get('highest_price'),
+                'lowest_price': row_dict.get('lowest_price')
             }
             # Verify with exchange (optional but safe)
             try:
@@ -1307,7 +1309,7 @@ class FuturesTradingBot:
         print("🚀" + "="*80)
         print("🚀 STANDALONE FUTURES TRADING BOT (FAST LOOP ENABLED)")
         print("🚀" + "="*80)
-        print(f"💎 Symbol: {symbol}")
+        print(f"💎 Scanning Universe: {', '.join(TRADE_SYMBOLS)}")
         print(f"⚡ Strategy: Pure Futures with BTC Correlation")
         print(f"📊 Risk Per Trade: {futures_risk_per_trade*100:.0f}% of USDT balance")
         print(f"⏰ Analysis Frequency: Every 5 minutes")
