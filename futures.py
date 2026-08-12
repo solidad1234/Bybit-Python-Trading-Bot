@@ -54,7 +54,10 @@ futures_state = {
     'consecutive_losses': 0,
     'max_consecutive_losses': 3,
     'session_start': datetime.now(),
-    'available_balance': 0
+    'available_balance': 0,
+    # P&L circuit breaker: halt if session losses exceed 5% of starting balance
+    'session_start_balance': 0,
+    'session_pnl': 0.0,
 }
 
 class FuturesTradingBot:
@@ -300,6 +303,9 @@ class FuturesTradingBot:
             print(f"⚠️ WARNING: USDT balance ${usdt_balance:.2f} is below recommended minimum ${min_balance_required}")
         
         futures_state['available_balance'] = usdt_balance
+        # Seed circuit breaker baseline (only set once at startup)
+        if futures_state['session_start_balance'] == 0:
+            futures_state['session_start_balance'] = usdt_balance
         
         print(f"💰 Futures Balance Initialized:")
         print(f"   Available USDT: ${usdt_balance:.2f}")
@@ -665,14 +671,19 @@ class FuturesTradingBot:
             except Exception as leverage_error:
                 print(f"⚠️ Leverage setting error: {leverage_error} (continuing)")
             
-            # Place the order
+            # Place the order — SL/TP included atomically to eliminate the race
+            # window that exists when stops are set in a separate API call after fill.
             side = "Buy" if signal["signal"] == "LONG" else "Sell"
             order_params = {
                 "category": "linear",
                 "symbol": symbol,
                 "side": side,
                 "orderType": "Market",
-                "qty": f"{position_data['position_size']:.1f}"
+                "qty": f"{position_data['position_size']:.1f}",
+                "stopLoss": str(round(stop_loss, 2)),
+                "takeProfit": str(round(take_profit, 2)),
+                "slTriggerBy": "MarkPrice",
+                "tpTriggerBy": "MarkPrice",
             }
             
             print(f"\n🚀 FUTURES {signal['signal']} Order:")
@@ -680,29 +691,14 @@ class FuturesTradingBot:
             print(f"   📊 Position: {position_data['position_size']:.1f} SOL")
             print(f"   ⚡ Leverage: {signal['leverage']:.1f}x")
             print(f"   🎯 Entry: ${current_price:.2f}")
-            print(f"   🛡️ Stop: ${stop_loss:.2f}")
-            print(f"   💎 Target: ${take_profit:.2f}")
+            print(f"   🛡️ Stop: ${stop_loss:.2f} (atomic, mark-price triggered)")
+            print(f"   💎 Target: ${take_profit:.2f} (atomic, mark-price triggered)")
             print(f"   💀 Max Risk: ${position_data['actual_risk']:.2f}")
             
             result = session.place_order(**order_params)
             
             if result.get("retCode") == 0:
-                print(f"✅ Futures {signal['signal']} order placed successfully!")
-                
-                # Set stops
-                try:
-                    stop_result = session.set_trading_stop(
-                        category="linear",
-                        symbol=symbol,
-                        stopLoss=str(round(stop_loss, 2)),
-                        takeProfit=str(round(take_profit, 2))
-                    )
-                    if stop_result.get("retCode") == 0:
-                        print(f"✅ Stops set successfully")
-                    else:
-                        print(f"⚠️ Could not set stops: {stop_result.get('retMsg')}")
-                except Exception as e:
-                    print(f"⚠️ Error setting stops: {e}")
+                print(f"✅ Futures {signal['signal']} order placed with SL/TP set atomically!")
                 
                 # Store position
                 futures_state['position'] = {
@@ -871,8 +867,31 @@ class FuturesTradingBot:
         return current_stop
 
     
+    def _place_reduce_only_order(self, direction, qty):
+        """Place a reduceOnly market order to partially or fully close a position.
+        Returns True on success, False on failure. Safe to call if already closed
+        (Bybit will reject cleanly with retCode != 0)."""
+        try:
+            close_side = "Sell" if direction == "LONG" else "Buy"
+            result = session.place_order(
+                category="linear",
+                symbol=symbol,
+                side=close_side,
+                orderType="Market",
+                qty=str(round(qty, 1)),
+                reduceOnly=True,
+            )
+            if result.get("retCode") == 0:
+                return True
+            else:
+                print(f"⚠️ Reduce-only order rejected: {result.get('retMsg')}")
+                return False
+        except Exception as e:
+            print(f"⚠️ Reduce-only order error: {e}")
+            return False
+
     def partial_position_management(self, position, current_price, indicators):
-        """Take partial profits to reduce risk"""
+        """Take partial profits to reduce risk — sends real reduce-only orders."""
         
         if not position:
             return None
@@ -886,37 +905,76 @@ class FuturesTradingBot:
         else:  # LONG
             pnl_pct = (current_price - entry_price) / entry_price
         
-        changed = False
         # Take 25% profit at 1.5% gain
         if pnl_pct >= 0.015 and not position.get('exit_25_taken'):
-            position['exit_25_taken'] = True
-            print(f"💰 Taking 25% profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
-            self.save_position_state()
+            partial_qty = round(position['size'] * 0.25, 1)
+            if partial_qty < 0.1:
+                partial_qty = 0.1  # Bybit minimum
+            print(f"💰 Placing 25% partial close ({partial_qty:.1f} SOL) at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
+            if self._place_reduce_only_order(direction, partial_qty):
+                position['size'] = round(position['size'] - partial_qty, 1)
+                position['exit_25_taken'] = True
+                print(f"✅ 25% partial closed — remaining size: {position['size']:.1f} SOL")
+                self.save_position_state()
         
         # Take another 25% at 3% gain
         if pnl_pct >= 0.03 and not position.get('exit_50_taken'):
-            position['exit_50_taken'] = True
-            print(f"💰 Taking 25% more profit at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
-            self.save_position_state()
+            partial_qty = round(position['size'] * 0.25, 1)
+            if partial_qty < 0.1:
+                partial_qty = 0.1
+            print(f"💰 Placing second 25% partial ({partial_qty:.1f} SOL) at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
+            if self._place_reduce_only_order(direction, partial_qty):
+                position['size'] = round(position['size'] - partial_qty, 1)
+                position['exit_50_taken'] = True
+                print(f"✅ 50% total closed — remaining size: {position['size']:.1f} SOL")
+                self.save_position_state()
         
-        # Move stop to breakeven after 25% taken (1.5% gain)
+        # Move stop to breakeven after first partial (risk-free remainder)
         if position.get('exit_25_taken') and not position.get('stop_moved_to_be'):
             position['stop'] = entry_price
             position['stop_moved_to_be'] = True
             print(f"🛡️ Stop moved to breakeven: ${entry_price:.2f}")
+            try:
+                session.set_trading_stop(
+                    category="linear",
+                    symbol=symbol,
+                    stopLoss=str(round(entry_price, 2)),
+                )
+            except Exception as e:
+                print(f"⚠️ Could not update exchange SL to breakeven: {e}")
             self.save_position_state()
     
     def close_position(self, result_type, log_already_done=False, exit_price=None):
-        """Close futures position"""
+        """Close futures position. Sends a reduceOnly market order as a safety net
+        (harmless if exchange SL/TP already closed it — Bybit will reject cleanly)."""
         if not futures_state['position']:
             return
         
         pos = futures_state['position']
-        print(f"🚀 Closing futures {pos['direction']} position")
+        print(f"🚀 Closing futures {pos['direction']} position ({result_type})")
+        
+        # Safety-net close: reduceOnly so it fails gracefully if already closed by exchange SL/TP
+        remaining_size = pos.get('size', 0)
+        if remaining_size >= 0.1:
+            closed = self._place_reduce_only_order(pos['direction'], remaining_size)
+            if closed:
+                print(f"✅ Market close order sent for {remaining_size:.1f} SOL")
+            else:
+                print(f"ℹ️ Close order rejected — position likely already closed by exchange SL/TP")
         
         if not log_already_done:
             self.log_trade_outcome(exit_price=exit_price)
-            
+        
+        # Update session P&L for circuit breaker
+        if exit_price and pos.get('entry'):
+            size = pos.get('size', 0)
+            if pos['direction'] == 'LONG':
+                trade_pnl = (exit_price - pos['entry']) * size
+            else:
+                trade_pnl = (pos['entry'] - exit_price) * size
+            futures_state['session_pnl'] += trade_pnl
+            print(f"📊 Session PnL updated: ${futures_state['session_pnl']:.2f}")
+        
         # Update statistics
         if result_type == "WIN":
             futures_state['winning_trades'] += 1
@@ -933,6 +991,13 @@ class FuturesTradingBot:
         
         if futures_state['consecutive_losses'] >= futures_state['max_consecutive_losses']:
             return False, "Too many consecutive losses"
+        
+        # Daily P&L circuit breaker: halt if session loss exceeds 5% of starting balance
+        start_bal = futures_state.get('session_start_balance', 0)
+        if start_bal > 0:
+            session_loss_pct = futures_state['session_pnl'] / start_bal
+            if session_loss_pct < -0.05:
+                return False, f"Daily P&L circuit breaker tripped ({session_loss_pct*100:.1f}% session loss)"
         
         return True, "Can trade"
     
@@ -1047,6 +1112,8 @@ class FuturesTradingBot:
         last_analysis_time = 0
         analysis_interval = 300  # 5 minutes
         indicators_cache = None
+        # Date-based daily reset — reliable regardless of loop timing or restarts
+        last_reset_date = datetime.now().date()
         
         # If we restarted with a position, try to get initial indicators for trailing stop math
         if futures_state['position']:
@@ -1073,10 +1140,14 @@ class FuturesTradingBot:
                     if indicators:
                         indicators_cache = indicators
                     
-                    # Reset daily counters at midnight
-                    if datetime.now().hour == 0 and datetime.now().minute < 5:
+                    # Date-based daily counter reset (reliable across restarts & slow loops)
+                    today = datetime.now().date()
+                    if today != last_reset_date:
                         futures_state['daily_trades'] = 0
-                        print("🌅 Daily trading counter reset")
+                        futures_state['session_pnl'] = 0.0
+                        futures_state['session_start_balance'] = self.get_usdt_balance()
+                        last_reset_date = today
+                        print(f"🌅 New trading day ({today}) — counters and circuit breaker reset")
                     
                     # Update balance periodically
                     if cycle_count % 12 == 0:  # Every hour (12 * 5 mins)
