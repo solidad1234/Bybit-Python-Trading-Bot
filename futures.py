@@ -43,6 +43,7 @@ session = HTTP(
     testnet=False,
     api_key=api_key,
     api_secret=api_secret,
+    recv_window=15000,
 )
 
 # Futures Trading State
@@ -72,8 +73,13 @@ class FuturesTradingBot:
 
     def init_db(self):
         """Initialize SQLite database for state persistence"""
-        self.conn = sqlite3.connect('trading_state.db', check_same_thread=False)
+        self.conn = sqlite3.connect('trading_state.db', timeout=30.0, check_same_thread=False)
         self.cursor = self.conn.cursor()
+        try:
+            self.cursor.execute('PRAGMA journal_mode=WAL;')
+            self.cursor.execute('PRAGMA busy_timeout=30000;')
+        except Exception as e:
+            print(f"⚠️ Could not set WAL/busy_timeout PRAGMA: {e}")
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS position (
                 id INTEGER PRIMARY KEY,
@@ -173,27 +179,43 @@ class FuturesTradingBot:
             return
             
         pos = futures_state['position']
-        self.cursor.execute('DELETE FROM position')
-        self.cursor.execute('''
-            INSERT INTO position (
-                symbol, direction, size, entry, stop, target, leverage, margin,
-                order_id, timestamp, exit_25_taken, exit_50_taken,
-                stop_moved_to_be, original_stop, highest_price, lowest_price
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            pos['symbol'], pos['direction'], pos['size'], pos['entry'], pos['stop'],
-            pos['target'], pos['leverage'], pos['margin'], pos['order_id'],
-            str(pos['timestamp']), int(pos.get('exit_25_taken', False)), 
-            int(pos.get('exit_50_taken', False)), int(pos.get('stop_moved_to_be', False)),
-            pos.get('original_stop', pos['stop']), pos.get('highest_price', pos['entry']),
-            pos.get('lowest_price', pos['entry'])
-        ))
-        self.conn.commit()
+        for attempt in range(3):
+            try:
+                self.cursor.execute('DELETE FROM position')
+                self.cursor.execute('''
+                    INSERT INTO position (
+                        symbol, direction, size, entry, stop, target, leverage, margin,
+                        order_id, timestamp, exit_25_taken, exit_50_taken,
+                        stop_moved_to_be, original_stop, highest_price, lowest_price
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    pos['symbol'], pos['direction'], pos['size'], pos['entry'], pos['stop'],
+                    pos['target'], pos['leverage'], pos['margin'], pos['order_id'],
+                    str(pos['timestamp']), int(pos.get('exit_25_taken', False)), 
+                    int(pos.get('exit_50_taken', False)), int(pos.get('stop_moved_to_be', False)),
+                    pos.get('original_stop', pos['stop']), pos.get('highest_price', pos['entry']),
+                    pos.get('lowest_price', pos['entry'])
+                ))
+                self.conn.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
+                else:
+                    print(f"⚠️ Warning: database is locked when saving position state ({e}). Will retry next cycle.")
+            except Exception as e:
+                print(f"⚠️ Error saving position state: {e}")
+                break
         
     def load_position_state(self):
         """Load active position from SQLite on startup"""
-        self.cursor.execute('SELECT * FROM position LIMIT 1')
-        row = self.cursor.fetchone()
+        try:
+            self.cursor.execute('SELECT * FROM position LIMIT 1')
+            row = self.cursor.fetchone()
+        except Exception as e:
+            print(f"⚠️ Error reading position state from DB: {e}")
+            row = None
+
         if row:
             columns = [col[0] for col in self.cursor.description]
             row_dict = dict(zip(columns, row))
@@ -234,8 +256,19 @@ class FuturesTradingBot:
 
     def clear_position_state(self):
         """Clear position from SQLite"""
-        self.cursor.execute('DELETE FROM position')
-        self.conn.commit()
+        for attempt in range(3):
+            try:
+                self.cursor.execute('DELETE FROM position')
+                self.conn.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
+                else:
+                    print(f"⚠️ Warning: database is locked when clearing position state ({e}).")
+            except Exception as e:
+                print(f"⚠️ Error clearing position state: {e}")
+                break
         futures_state['position'] = None
         
     def save_state(self):
