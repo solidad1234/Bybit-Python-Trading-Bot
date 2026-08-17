@@ -7,7 +7,10 @@ import requests
 import hmac
 import hashlib
 import time
-import talib
+try:
+    import talib
+except ImportError:
+    talib = None
 import numpy as np
 from datetime import datetime, timedelta
 from pybit.unified_trading import HTTP
@@ -638,7 +641,7 @@ class FuturesTradingBot:
             indicators["15m"]["rsi"] > 65,
             indicators["1h"]["rsi"] > 55,
             indicators["15m"]["macd"] < indicators["15m"]["macd_signal"],
-            indicators["15m"]["macd_histogram"] < -0.2,
+            (indicators["15m"]["macd_histogram"] / current_price) < -0.0005 if current_price > 0 else False,
             current_price < indicators["15m"]["ema_21"],
             indicators["15m"]["volume_ratio"] > 1.4,
             volatility > 0.025,
@@ -673,10 +676,12 @@ class FuturesTradingBot:
         return {"signal": None, "strength": max(long_score, short_score)}
     
     def calculate_futures_position_size(self, entry_price, stop_loss_price,
-                                        leverage=10.0, symbol="SOLUSDT"):
+                                        leverage=10.0, symbol=None):
         """Calculate safe futures position size with symbol-aware lot constraints."""
+        if not symbol or symbol not in SYMBOL_CONTRACT_SPECS:
+            raise ValueError(f"calculate_futures_position_size requires valid symbol in {list(SYMBOL_CONTRACT_SPECS.keys())}")
 
-        specs = SYMBOL_CONTRACT_SPECS.get(symbol, SYMBOL_CONTRACT_SPECS["SOLUSDT"])
+        specs = SYMBOL_CONTRACT_SPECS[symbol]
         min_order_size = specs["min_qty"]
         step_size      = specs["step_size"]
         ticker         = specs["ticker"]
@@ -902,14 +907,20 @@ class FuturesTradingBot:
             # Place the order — SL/TP included atomically to eliminate the race
             # window that exists when stops are set in a separate API call after fill.
             side = "Buy" if signal["signal"] == "LONG" else "Sell"
+            
+            # Format qty and SL/TP according to contract precision per symbol
+            step_size     = SYMBOL_CONTRACT_SPECS.get(trade_sym, {}).get("step_size", 0.1)
+            qty_precision = 2 if step_size < 0.1 else 1
+            price_precision = 4 if current_price < 100 else 2
+            
             order_params = {
                 "category": "linear",
                 "symbol": trade_sym,
                 "side": side,
                 "orderType": "Market",
-                "qty": f"{position_data['position_size']:.1f}",
-                "stopLoss": str(round(stop_loss, 2)),
-                "takeProfit": str(round(take_profit, 2)),
+                "qty": f"{position_data['position_size']:.{qty_precision}f}",
+                "stopLoss": f"{stop_loss:.{price_precision}f}",
+                "takeProfit": f"{take_profit:.{price_precision}f}",
                 "slTriggerBy": "MarkPrice",
                 "tpTriggerBy": "MarkPrice",
             }

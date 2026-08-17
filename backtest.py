@@ -24,7 +24,10 @@ import time
 import numpy as np
 import pandas as pd
 import requests
-import talib
+try:
+    import talib
+except ImportError:
+    talib = None
 from datetime import datetime, timezone, timedelta
 from factors.support_resistance import detect_sr_levels_from_arrays
 
@@ -327,7 +330,7 @@ def calculate_signal(row15, row1h, row4h, volatility, regime_score=0.0):
         row15["rsi"] > 65,
         row1h["rsi"] > 55,
         row15["macd"] < row15["macd_signal"],
-        row15["macd_histogram"] < -0.2,
+        (row15["macd_histogram"] / row15["close"]) < -0.0005 if row15["close"] > 0 else False,
         row15["close"] < row15["ema_21"],
         row15["volume_ratio"] > 1.4,
         volatility > 0.025,

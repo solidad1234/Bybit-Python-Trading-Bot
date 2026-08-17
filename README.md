@@ -1,305 +1,129 @@
 # Bybit Python Trading Bot
 
-A high-performance algorithmic trading bot built for Bybit, utilizing technical analysis (TA-LIB) for multi-timeframe trend following and momentum strategies.
-
-## Features
-
-- **Technical Market Analysis**: Uses the `TA-LIB` library for precise calculations.
-- **Indicators Used**: RSI, MACD, Moving Averages (MA, EMA, SMA), ATR, Bollinger Bands, and Stochastic RSI based on multi-timeframe Kline data (15m, 1h, 4h).
-- **Multi-Factor Regime Gate (V2 Engine)**: Incorporates macro regime filtering, derivatives flow (Funding rates, Open Interest), and sentiment analysis to filter out false TA signals.
-- **Dynamic Asset Scanning**: Concurrently scans a robust universe of high-liquidity assets (SOL, ETH, AVAX, LINK, BNB) to execute the highest-probability setup instead of relying on a single pair.
-- **BTC Trend Filter**: Monitors Bitcoin's momentum to filter out false signals in altcoin pairs.
-- **Advanced Risk Management**: 
-  - **Dynamic Thresholding**: Elevates the evidentiary threshold for LONG setups during highly bearish macroeconomic regimes.
-  - **Early Scratch Exit**: Immediately cuts positions (-0.7%) if they move adversely within the first 45 minutes, significantly improving R-multiples by capping rapid dumps.
-  - Uses Average True Range (ATR) to dynamically calculate realistic Stop Loss and Take Profit levels.
-  - Implements trailing stops based on real-time price action to lock in profits.
-  - Scales out of positions (25% take profits at 2% and 3.5% gains).
-- **Robust State Management**: Uses **SQLite3 (`trading_state.db`)** to persist open position data and rich multi-factor trade logs.
-- **Dual Execution Loop**: 
-  - **Fast Loop (Every 10s)**: Rapidly queries current price tickers to manage open positions, trigger early scratch exits, trailing stops, and partial take-profits.
-  - **Slow Loop (Every 5m)**: Scans the multi-asset universe and calculates technical + multi-factor consensus.
-
-## Setup
-
-1. Rename `.env.example` to `.env` and add your Bybit `API_KEY` and `API_SECRET`.
-2. Ensure you have the required dependencies installed (including `TA-LIB` C++ binaries and python wrapper, `pybit`, and `numpy`).
-3. Run the bot: `python futures.py`
-# 🚀 Bybit Python Trading Bot
+> [!WARNING]
+> ### ⚠️ Disclaimer
+> Cryptocurrency trading involves substantial risk of loss and is not suitable for every investor.  
+> This trading bot is provided **strictly for educational and research purposes**.  
+> - There are **no guarantees of profit**, and you can lose some or all of your collateral.  
+> - Always **Do Your Own Research (DYOR)** and test extensively in testnet/sandbox environments before trading live funds.  
+> - The author(s) accept **no responsibility or liability** for financial losses incurred through the use of this software.
 
 ---
 
-## ⚠️ Disclaimer
+A modular, multi-factor algorithmic trading system built for **Bybit USDT Perpetual Futures & Spot markets**. Powered by **Support & Resistance structural anchors**, multi-timeframe Technical Analysis, Macro Regime detection, Derivatives flow, Sentiment caching, and Google News RSS filtering.
 
-Cryptocurrency assets are highly volatile and carry significant risk.  
-This bot is provided **for educational and research purposes only**.  
-There are **no guarantees of profit**, and you could lose some or all of your capital.  
+---
 
-- Do your own research (DYOR) before using this bot.  
-- Test extensively in a demo/sandbox environment first.  
-- Only trade with money you can afford to lose.  
-- The author(s) of this project are **not responsible** for any financial losses incurred.  
+## 🌟 Key Features & Architecture (V2 Engine)
 
-By using this bot, you acknowledge and accept these risks.
+### 1. 🛡️ BTC Correlation & Macro News Dual Guard
+* **BTC Price Correlation**: Continuously monitors Bitcoin's 1h and 4h price momentum. Automatically blocks LONG setups across all altcoin pairs if BTC exhibits bearish momentum ($1\text{h change} < -2.0\%$ or $4\text{h change} < -5.0\%$).
+* **BTC Macro News Filter**: Evaluates macro market news alongside coin-specific headlines. Macro BTC news contributes a 40% weight to every asset's news score. If macro BTC news is severely negative, all trades across the universe are halted.
 
+### 2. 🎯 Support & Resistance (S/R) Execution Engine (`factors/support_resistance.py`)
+* **Multi-Timeframe Level Detection**: Combines 1h swing levels (~4 days), 4h structural walls (~17 days), and auto-scaled psychological round-number grids ($5 for SOL/AVAX, $50 for BNB, $100 for ETH).
+* **5 Actionable Scenarios**:
+  1. **`AT_SUPPORT`**: Price at key support $\rightarrow$ **BOUNCE LONG** setup (Stop: below support wall).
+  2. **`AT_RESISTANCE`**: Price at key resistance $\rightarrow$ **REJECTION SHORT** setup (Stop: above resistance wall).
+  3. **`BREAKOUT_ABOVE`**: Price closes $\ge 1.0\%$ above resistance with volume $> 1.5\times$ 20-period SMA $\rightarrow$ **BREAKOUT LONG ⚡** (Leverage boosted to **12×**, Stop anchored at broken resistance).
+  4. **`BREAKDOWN_BELOW`**: Price closes $\ge 1.0\%$ below support with volume $> 1.5\times$ 20-period SMA $\rightarrow$ **BREAKDOWN SHORT ⚡** (Leverage boosted to **12×**, Stop anchored at broken support).
+  5. **`MID_RANGE`**: Price in mid-range $\rightarrow$ Neutral score (-0.1), defaults to ATR-based stops.
+* **1% Volume-Confirmed Breakout Boost**: Prevents low-volume fake-outs by enforcing a 15m candle close $\ge 1.0\%$ beyond the level **AND** volume $> 1.5\times$ SMA.
 
-This repository contains **three automated crypto trading bots** for **Bybit**, built with Python — **spot trading**, **futures trading**, and **hybrid trading** (combining both). Each bot is designed for real-time execution and can be deployed on a VPS for continuous operation.
+### 3. 🔬 6-Factor Multi-Factor Consensus Engine (`factors/aggregator.py`)
+Rebalanced consensus engine evaluates 6 distinct factors before approving any trade:
+
+| Factor | Weight | Key Metrics & Signals |
+| :--- | :---: | :--- |
+| **`regime`** | **25%** | Macro BTC market regime (Bull / Bear / Neutral) & 4h EMA trend gate |
+| **`derivatives`** | **22%** | Bybit Funding Rates, Open Interest (OI) velocity, & Long/Short ratio |
+| **`technical`** | **20%** | Multi-timeframe (15m, 1h, 4h) RSI, MACD, ADX, Stochastic & Volume TA |
+| **`support_resistance`** | **15%** | S/R proximity, level touch counts, and volume-confirmed breakouts |
+| **`sentiment`** | **12%** | 1-hour TTL cached Crypto Fear & Greed contrarian sentiment |
+| **`news`** | **6%** | Asymmetric news scoring (Bad coin news blocks LONGs, allows SHORTs) |
+
+### 4. 🌐 Dynamic Multi-Asset Universe Scanning
+* Dynamically scans high-liquidity assets: `SOLUSDT`, `ETHUSDT`, `AVAXUSDT`, `LINKUSDT`, `BNBUSDT`.
+* **Symbol-Aware Contract Precision**: Enforces exact Bybit lot sizes (`min_qty` & `step_size`) and price precisions per asset.
+
+### 5. 🛡️ Advanced Risk Management & Atomic Orders
+* **Atomic Execution**: Market orders are submitted to Bybit with Stop Loss (SL) and Take Profit (TP) parameters set **atomically** in a single API call, eliminating execution race conditions.
+* **P&L Session Circuit Breaker**: Automatically halts trading if session losses exceed **5% of initial balance**.
+* **Consecutive Loss Cooldown**: Pauses trading after **3 consecutive losses**.
+* **Early Scratch Exit**: Immediately exits adverse positions (-0.7%) within the first 45 minutes to protect capital.
+
+### 6. 💾 State Persistence & AI/ML Logging (`trading_state.db`)
+* SQLite WAL-mode database persists open position state across restarts.
+* Logs rich multi-factor context (`trade_log` table) for every entry/exit, creating a structured dataset for machine learning model training (XGBoost).
+
+---
 
 ## 🤖 Available Trading Bots
 
-### 1. **Spot Trading Bot** (`spot.py`)
-- **Strategy**: Full-balance spot trading (buy low, sell high)
-- **Asset**: Uses USDT to buy SOL, sells SOL for USDT
-- **Risk**: No liquidation risk, conservative approach
-- **Best for**: Bull markets and trending conditions
-
-### 2. **Futures Trading Bot** (`futures.py` - V2 Engine) 
-- **Strategy**: Leveraged perpetual contracts utilizing multi-asset scanning.
-- **Assets**: Dynamically scans SOL, ETH, AVAX, LINK, BNB for the best setup.
-- **Direction**: Both LONG and SHORT positions (Max 1 Open Position at a time).
-- **Risk**: Dynamic risk management with Early Scratch Exits and Regime-based thresholds.
-- **Best for**: Trading high-conviction macro-aligned setups across top altcoins.
-
-### 3. **🌟 Hybrid Trading Bot** (`hybrid.py`) - **RECOMMENDED**
-- **Strategy**: Combines spot + futures for maximum opportunities
-- **Portfolio Split**: 70% spot allocation + 30% futures allocation  
-- **Advantages**:
-  - ✅ Captures **both directions** (corrections via futures shorts)
-  - ✅ **Proven spot strategy** remains intact
-  - ✅ **Risk managed** futures positions (2-5% risk per trade)
-  - ✅ **5-minute analysis cycles** (4x faster than spot-only)
-  - ✅ **BTC correlation filtering** prevents counter-trend trades
-  - ✅ **No interference** between strategies
-
-## 🎯 Hybrid Bot Strategy Breakdown
-
-### **Spot Component (70% allocation)**
-- **LONG signals**: Uses USDT to buy SOL during dips
-- **SELL signals**: Sells SOL for USDT during peaks
-- **Risk**: Conservative, no liquidation risk
-- **Position sizing**: Uses available USDT balance
-
-### **Futures Component (30% allocation)**  
-- **SHORT signals**: Profits from market corrections (finally!)
-- **LONG signals**: Additional leverage on strong bullish moves
-- **Risk**: 2% of USDT balance per trade
-- **Leverage**: 2-3x (conservative)
-- **Margin**: Uses actual USDT balance for collateral
-
-### **Technical Analysis**
-- **Multi-timeframe**: 15m, 1h, 4h analysis
-- **Signal thresholds**: Spot (7/12), Futures (5/10)
-- **Indicators**: RSI, MACD, EMA, ADX, Stochastic, Bollinger Bands
-- **BTC correlation**: Prevents trades against Bitcoin trend
-
-## ⚙️ Setup Instructions
-
-### 1. Clone the Repository
-```bash
-git clone https://github.com/solidad1234/Bybit-Python-Trading-Bot.git
-cd bybit-trading-bot
-```
-
-### 2. Create a Virtual Environment
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install TA-Lib (Required)
-```bash
-# Ubuntu/Debian
-sudo apt update
-sudo apt install -y python3-dev build-essential
-sudo dpkg -i ~/Downloads/ta-lib_0.6.4_amd64.deb
-
-# Or compile from source
-wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
-tar -xzf ta-lib-0.4.0-src.tar.gz
-cd ta-lib/
-./configure --prefix=/usr
-make
-sudo make install
-```
-
-### 4. Install Python Dependencies
-```bash
-pip install -r requirements.txt
-```
-
-### 5. Environment Configuration
-Create a `.env` file in the project root:
-```env
-API_KEY=your_bybit_api_key
-API_SECRET=your_bybit_api_secret
-```
-
-**⚠️ Important**: Ensure your Bybit account has:
-- **Unified Trading Account** enabled
-- **API permissions** for spot and futures trading
-- **USDT balance** for futures margin (recommended: $20+ USDT)
-
-## ▶️ Running the Bots
-
-### 🌟 **Run Hybrid Bot (Recommended)**
-```bash
-python3 hybrid.py
-```
-
-### Run Spot Bot Only
-```bash
-python3 spot.py
-```
-
-### Run Futures Bot Only
-```bash
-python3 futures.py
-```
-
-## 💰 Balance Requirements
-
-### **For Hybrid Trading:**
-- **Minimum**: $50 total portfolio value
-- **Recommended**: $100+ total portfolio  
-- **USDT**: At least $20 for futures margin
-- **SOL**: Any amount (can be converted as needed)
-
-### **Example Optimal Setup:**
-```
-Total Portfolio: $200
-├── USDT: $60 (30% for futures margin)
-└── SOL: $140 worth (70% for spot trading)
-```
-
-## 🧪 Running Tests
-
-### Test Spot Bot
-```bash
-python3 test.py
-```
-
-### Test Futures Bot
-```bash
-python3 test_futures.py
-```
-
-### Test Hybrid Bot
-```bash
-python3 hybrid.py  # Monitor first few cycles
-```
-
-## 📊 Expected Performance
-
-### **Proven Results (3-week backtest)**
-- **Spot component**: 0 losses, consistent profits in trending markets
-- **Missing opportunities**: ~15-20% additional gains from corrections
-- **Hybrid potential**: 20-40% improvement over spot-only approach
-
-### **Risk Management**
-- **Spot trading**: No liquidation risk
-- **Futures trading**: Max 2-5% of USDT balance per trade
-- **Portfolio protection**: Conservative leverage (2-3x max)
-- **Daily limits**: 3 spot trades, 5 futures trades maximum
-
-## 🖥️ Deploying on VPS
-
-### Option 1: Using `screen` 
-```bash
-sudo apt install screen
-
-# For Hybrid Bot
-screen -S hybrid-bot
-cd ~/bybit-trading-bot
-source venv/bin/activate
-python3 hybrid.py
-
-# For Spot Bot
-screen -S spot-bot
-python3 spot.py
-
-# For Futures Bot  
-screen -S futures-bot
-python3 futures.py
-```
-
-**Detach from screen**: `Ctrl + A, then D`  
-**Reattach later**: `screen -r hybrid-bot`
-
-### Option 2: Auto-Start on Reboot
-```bash
-crontab -e
-```
-
-Add line for your preferred bot:
-```bash
-# Hybrid Bot (recommended)
-@reboot screen -dmS hybrid-bot bash -c 'cd ~/bybit-trading-bot && source venv/bin/activate && python3 hybrid.py >> hybrid.log 2>&1'
-
-# Spot Bot only
-@reboot screen -dmS spot-bot bash -c 'cd ~/bybit-trading-bot && source venv/bin/activate && python3 spot.py >> spot.log 2>&1'
-
-# Futures Bot only  
-@reboot screen -dmS futures-bot bash -c 'cd ~/bybit-trading-bot && source venv/bin/activate && python3 futures.py >> futures.log 2>&1'
-```
-
-## 🔧 Configuration Options
-
-### **Hybrid Bot Settings** (`hybrid.py`)
-```python
-# Portfolio allocation
-SPOT_ALLOCATION = 0.70     # 70% for spot trading
-FUTURES_ALLOCATION = 0.30  # 30% for futures trading
-
-# Risk management
-futures_risk_per_trade = 0.05  # 5% risk per futures trade
-max_leverage = 3.0             # Maximum leverage
-min_reward_ratio = 2.5         # Minimum 2.5:1 reward:risk
-
-# Signal thresholds
-signal_strength_threshold = 5  # Futures signals
-spot_signal_threshold = 7      # Spot signals
-```
-
-## 📈 Strategy Comparison
-
-| Feature | Spot Only | Futures Only | **Hybrid** |
-|---------|-----------|--------------|------------|
-| **Profit Directions** | Buy low, sell high | Long + Short | **All directions** |
-| **Risk Level** | Low | High | **Balanced** |
-| **Capital Efficiency** | Low | High | **Optimized** |
-| **Market Coverage** | Bull markets | All markets | **All markets** |
-| **Liquidation Risk** | None | High | **Managed** |
-| **Complexity** | Simple | Complex | **Moderate** |
-
-## ⚠️ Important Notes
-
-### **Risk Warnings**
-- **Cryptocurrency trading involves substantial risk**
-- **Past performance does not guarantee future results**
-- **Never invest more than you can afford to lose**
-- **Test with small amounts first**
-
-### **Hybrid Bot Advantages**
-- ✅ **Proven spot strategy** + new futures opportunities
-- ✅ **Independent operation** - can run alongside existing spot bot
-- ✅ **Conservative leverage** - 2-3x maximum vs 100x available
-- ✅ **Multiple safety mechanisms** - daily limits, consecutive loss protection
-- ✅ **Real-world tested** - based on 3 weeks of successful spot trading
-
-## 🤝 Contributions
-
-Pull requests are welcome! Please ensure any changes are:
-- **Well-tested** with small amounts first
-- **Clearly documented** with comments
-- **Risk-aware** and include proper error handling
-
-## 📬 Contact
-
-For questions, support, or collaborations:
-
-**Solidad Kimeu**  
-📧 [solidadkimeu@gmail.com](mailto:solidadkimeu@gmail.com)
+1. **Futures Trading Bot (`futures.py` - Recommended)**
+   - Leveraged USDT perpetual futures execution with multi-asset scanning, S/R anchors, 12× breakout leverage, and 6-factor consensus.
+2. **Hybrid Trading Bot (`hybrid.py`)**
+   - Allocates 70% portfolio to spot accumulation and 30% to futures hedging/momentum.
+3. **Spot Trading Bot (`spot.py`)**
+   - Conservative spot accumulation for trending markets.
 
 ---
 
-### 🚀 **Start with the Hybrid Bot for the best of both worlds!**
+## ⚙️ Setup & Deployment
+
+### 1. Installation & Environment
+
+```bash
+# Clone repository
+git clone https://github.com/solidad1234/Bybit-Python-Trading-Bot.git
+cd bybit-trading-bot
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### 2. Environment Variables Configuration
+
+Create a `.env` file in the project root:
+
+```env
+API_KEY=your_bybit_api_key
+API_SECRET=your_bybit_api_secret
+CRYPTOPANIC_TOKEN=optional_cryptopanic_token
+```
+
+### 3. Execution Commands
+
+```bash
+# Run Futures Trading Bot (Multi-Asset V2 Engine)
+python3 futures.py
+
+# Run Hybrid Trading Bot
+python3 hybrid.py
+
+# Run Backtest Engine (Multi-Asset S/R Historical Verification)
+python3 backtest.py
+```
+
+### 4. Deploying on VPS (using `screen`)
+
+```bash
+screen -S futures-bot
+source venv/bin/activate
+python3 futures.py
+```
+*Detach screen*: `Ctrl + A`, then `D`  
+*Reattach later*: `screen -r futures-bot`
+
+---
+
+## 🤝 Contributions & Contact
+
+Pull requests and issues are welcome!
+
+**Author**: Solidad Kimeu  
+📧 [solidadkimeu@gmail.com](mailto:solidadkimeu@gmail.com)
