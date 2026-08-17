@@ -64,7 +64,7 @@ class MultiFactorAggregator:
     def evaluate(
         self,
         ta_signal:     dict,
-        symbol:        str   = "SOLUSDT",
+        symbol:        str,
         current_price: float = 0.0,
         precomputed:   dict  = None,
         indicators:    dict  = None,
@@ -74,7 +74,7 @@ class MultiFactorAggregator:
         Parameters
         ----------
         ta_signal    : dict  Output of calculate_futures_signals()
-        symbol       : str   Bybit linear symbol
+        symbol       : str   Bybit linear symbol (e.g. 'ETHUSDT', 'SOLUSDT') — required!
         current_price: float Current mark price
         precomputed  : dict  Pre-fetched factor results (keys: "regime", "sentiment")
         indicators   : dict  Output of calculate_indicators() — for S/R factor

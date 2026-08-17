@@ -94,13 +94,13 @@ NEGATIVE_KEYWORDS = {
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_news_score(symbol: str = "SOLUSDT") -> dict:
+def get_news_score(symbol: str) -> dict:
     """
     Fetch Google News RSS headlines and return a two-layer composite score.
 
     Parameters
     ----------
-    symbol : str  Bybit linear symbol, e.g. "ETHUSDT"
+    symbol : str  Bybit linear symbol, e.g. "ETHUSDT" (required!)
 
     Returns
     -------
