@@ -22,7 +22,7 @@ BYBIT_URL = "https://api.bybit.com/v5/market"
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_derivatives_score(symbol: str = "SOLUSDT") -> dict:
+def get_derivatives_score(symbol: str) -> dict:
     """Combine funding, OI trend, and L/S ratio into one derivatives score."""
     funding = _funding(symbol)
     oi      = _open_interest(symbol)
