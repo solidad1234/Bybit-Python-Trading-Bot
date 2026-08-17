@@ -171,6 +171,8 @@ class FuturesTradingBot:
                 derivatives_score  REAL,
                 sentiment_score    REAL,
                 news_score         REAL,
+                sr_score           REAL,
+                sr_scenario        TEXT,
 
                 -- Regime classification
                 regime_class       TEXT,
@@ -405,10 +407,10 @@ class FuturesTradingBot:
                     size, pnl, result,
                     ta_signal_strength, aggregated_score, volatility, atr_15m,
                     technical_score, regime_score, derivatives_score,
-                    sentiment_score, news_score, regime_class,
+                    sentiment_score, news_score, sr_score, sr_scenario, regime_class,
                     funding_rate, open_interest, long_short_ratio,
                     news_sentiment, market_trend_4h
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ''', (
                 pos.get('symbol', 'UNKNOWN'),
                 entry_time,
@@ -428,6 +430,8 @@ class FuturesTradingBot:
                 fc.get('derivatives_score'),
                 fc.get('sentiment_score'),
                 fc.get('news_score'),
+                fc.get('sr_score'),
+                fc.get('sr_scenario'),
                 fc.get('regime_class'),
                 fc.get('funding_rate'),
                 fc.get('open_interest'),
@@ -739,8 +743,8 @@ class FuturesTradingBot:
             'ticker':          ticker,
         }
     
-    def calculate_improved_futures_stops(self, direction, current_price, indicators, signal_strength):
-        """Calculate wider, more realistic stops for futures trading"""
+    def calculate_improved_futures_stops(self, direction, current_price, indicators, signal_strength, sr_data=None):
+        """Calculate wider, more realistic stops for futures trading (with S/R anchor support)."""
         
         atr_15m = indicators["15m"]["atr"]
         atr_1h = indicators["1h"]["atr"]
@@ -748,6 +752,32 @@ class FuturesTradingBot:
         # Use LARGER ATR for futures to avoid noise
         primary_atr = max(atr_15m, atr_1h * 0.7)
         
+        # Priority 1: Use S/R-anchored stops if actionable scenario
+        if sr_data and sr_data.get("suggested_stop") and sr_data.get("suggested_target") and sr_data.get("scenario") != "MID_RANGE":
+            stop_loss = sr_data["suggested_stop"]
+            take_profit = sr_data["suggested_target"]
+            stop_distance = abs(current_price - stop_loss)
+            reward_amount = abs(take_profit - current_price)
+            reward_ratio = reward_amount / stop_distance if stop_distance > 0 else min_reward_ratio
+            
+            print(f"📊 S/R-Anchored Stop Calculation ({sr_data.get('scenario')}):")
+            print(f"   Entry: ${current_price:.4f}")
+            print(f"   Stop Loss: ${stop_loss:.4f}")
+            print(f"   Take Profit: ${take_profit:.4f}")
+            print(f"   Risk: ${stop_distance:.4f}")
+            print(f"   Reward: ${reward_amount:.4f}")
+            print(f"   Ratio: {reward_ratio:.2f}:1")
+            
+            return {
+                'stop_loss': round(stop_loss, 4),
+                'take_profit': round(take_profit, 4),
+                'risk_amount': stop_distance,
+                'reward_amount': reward_amount,
+                'reward_ratio': reward_ratio,
+                'method_used': f"sr_anchored_{sr_data.get('scenario')}",
+                'primary_atr_used': primary_atr
+            }
+
         print(f"📊 ATR Analysis:")
         print(f"   15m ATR: ${atr_15m:.2f}")
         print(f"   1h ATR: ${atr_1h:.2f}")
@@ -789,8 +819,8 @@ class FuturesTradingBot:
                 take_profit = current_price + (stop_distance * min_reward_ratio)
         
         return {
-            'stop_loss': round(stop_loss, 2),
-            'take_profit': round(take_profit, 2),
+            'stop_loss': round(stop_loss, 4),
+            'take_profit': round(take_profit, 4),
             'risk_amount': stop_distance,
             'reward_amount': abs(take_profit - current_price),
             'reward_ratio': abs(take_profit - current_price) / stop_distance,
@@ -810,9 +840,22 @@ class FuturesTradingBot:
         trade_sym = symbol_override
         ticker    = SYMBOL_CONTRACT_SPECS.get(trade_sym, {}).get("ticker", trade_sym)
         
-        # Calculate improved stops
+        sr_data = None
+        if factor_context:
+            sr_scenario = factor_context.get("sr_scenario", "MID_RANGE")
+            if sr_scenario != "MID_RANGE":
+                sr_data = {
+                    "scenario": sr_scenario,
+                    "suggested_stop": factor_context.get("sr_suggested_stop"),
+                    "suggested_target": factor_context.get("sr_suggested_target"),
+                    "suggested_leverage": factor_context.get("sr_suggested_leverage", 10.0),
+                }
+                if sr_data.get("suggested_leverage"):
+                    signal["leverage"] = sr_data["suggested_leverage"]
+
+        # Calculate improved stops (with S/R anchoring if present)
         stop_data = self.calculate_improved_futures_stops(
-            signal['signal'], current_price, indicators, signal['strength']
+            signal['signal'], current_price, indicators, signal['strength'], sr_data=sr_data
         )
         
         stop_loss = stop_data['stop_loss']
@@ -1294,8 +1337,11 @@ class FuturesTradingBot:
                 continue
 
             # Full multi-factor evaluation (regime pre-fetched, sentiment uses 1h cache)
+            # Pass indicators+data so S/R factor can detect swing levels
             consensus = aggregator.evaluate(signal, current_sym, current_price,
-                                            precomputed=precomputed)
+                                            precomputed=precomputed,
+                                            indicators=indicators,
+                                            data=data)
             if consensus["block_trade"] or consensus["signal"] is None:
                 continue
 
@@ -1306,6 +1352,7 @@ class FuturesTradingBot:
                 best_score = score_abs
                 
                 scores    = consensus.get("factor_scores", {})
+                sr_fs     = scores.get("support_resistance", {})
                 deriv_det = scores.get("derivatives", {}).get("details", {})
                 ind4h_now = indicators.get("4h", {})
                 trend_4h  = "BULL" if ind4h_now.get("ema_21", 0) > ind4h_now.get("ema_50", 0) else "BEAR"
@@ -1320,6 +1367,11 @@ class FuturesTradingBot:
                     "derivatives_score":   scores.get("derivatives", {}).get("score"),
                     "sentiment_score":     scores.get("sentiment", {}).get("score"),
                     "news_score":          scores.get("news",      {}).get("score"),
+                    "sr_score":            sr_fs.get("score"),
+                    "sr_scenario":         consensus.get("sr_scenario", "MID_RANGE"),
+                    "sr_suggested_stop":   consensus.get("sr_suggested_stop"),
+                    "sr_suggested_target": consensus.get("sr_suggested_target"),
+                    "sr_suggested_leverage": consensus.get("sr_suggested_leverage", 10.0),
                     "regime_class":        scores.get("regime", {}).get("details", {}).get("regime"),
                     "funding_rate":        deriv_det.get("funding",        {}).get("current_rate_pct"),
                     "open_interest":       deriv_det.get("open_interest",  {}).get("oi_change_pct"),
