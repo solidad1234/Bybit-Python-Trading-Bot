@@ -27,17 +27,21 @@ Usage in futures.py:
 
 import time
 
-from factors.regime      import get_regime_score
-from factors.derivatives import get_derivatives_score
-from factors.sentiment   import get_sentiment_score
-from factors.news        import get_news_score
+from factors.regime             import get_regime_score
+from factors.derivatives        import get_derivatives_score
+from factors.sentiment          import get_sentiment_score
+from factors.news               import get_news_score
+from factors.support_resistance import get_sr_score
 
+# Rebalanced to include Support/Resistance at 0.15
+# Total must equal 1.0
 WEIGHTS = {
-    "regime":      0.30,
-    "derivatives": 0.25,
-    "technical":   0.20,
-    "sentiment":   0.15,
-    "news":        0.10,
+    "regime":             0.25,   # macro BTC trend (crash indicator)
+    "derivatives":        0.22,   # funding + OI + L/S ratio
+    "technical":          0.20,   # RSI/MACD/ADX scoring
+    "support_resistance": 0.15,   # S/R proximity + breakout detection
+    "sentiment":          0.12,   # contrarian F&G (1h TTL cache)
+    "news":               0.06,   # two-layer macro+coin blocker
 }
 
 LONG_ENTRY_THRESHOLD          = 0.25
@@ -63,17 +67,18 @@ class MultiFactorAggregator:
         symbol:        str   = "SOLUSDT",
         current_price: float = 0.0,
         precomputed:   dict  = None,
+        indicators:    dict  = None,
+        data:          dict  = None,
     ) -> dict:
         """
         Parameters
         ----------
         ta_signal    : dict  Output of calculate_futures_signals()
-                             Must have keys: 'signal' (str|None), 'strength' (int)
-        symbol       : str   Bybit linear symbol, e.g. "ETHUSDT"
+        symbol       : str   Bybit linear symbol
         current_price: float Current mark price
-        precomputed  : dict  Pre-fetched factor results to avoid redundant API
-                             calls when scanning multiple symbols in a loop.
-                             Supported keys: "regime", "sentiment"
+        precomputed  : dict  Pre-fetched factor results (keys: "regime", "sentiment")
+        indicators   : dict  Output of calculate_indicators() — for S/R factor
+        data         : dict  Output of fetch_multi_timeframe_data() — for S/R factor
 
         Returns
         -------
@@ -92,10 +97,10 @@ class MultiFactorAggregator:
 
         factor_scores = {}
 
-        # 1. Technical Analysis (mapped from existing TA signal)
+        # 1. Technical Analysis
         factor_scores["technical"] = self._ta_to_score(ta_signal)
 
-        # 2. Regime — use precomputed if caller hoisted it outside the loop
+        # 2. Regime — use precomputed if available
         if "regime" in precomputed:
             factor_scores["regime"] = precomputed["regime"]
         else:
@@ -116,13 +121,13 @@ class MultiFactorAggregator:
                 "block_trade": False, "details": {"err": str(e)},
             }
 
-        # 4. Sentiment — use precomputed or 1-hour TTL cache
+        # 4. Sentiment — 1-hour TTL cache
         if "sentiment" in precomputed:
             factor_scores["sentiment"] = precomputed["sentiment"]
         else:
             factor_scores["sentiment"] = _get_cached_sentiment()
 
-        # 5. News — two-layer BTC macro + coin-specific composite
+        # 5. News — two-layer BTC macro + coin-specific
         try:
             factor_scores["news"] = get_news_score(symbol)
         except Exception as e:
@@ -130,6 +135,29 @@ class MultiFactorAggregator:
                 "score": 0.0, "confidence": 0.0,
                 "block_trade": False, "block_long_only": False,
                 "block_reason": "", "details": {"err": str(e)},
+            }
+
+        # 6. Support & Resistance — multi-timeframe level detection
+        try:
+            if indicators and data:
+                factor_scores["support_resistance"] = get_sr_score(
+                    symbol, current_price, indicators, data
+                )
+            else:
+                factor_scores["support_resistance"] = {
+                    "score": 0.0, "confidence": 0.0, "block_trade": False,
+                    "scenario": "MID_RANGE",
+                    "suggested_stop": None, "suggested_target": None,
+                    "suggested_leverage": 10.0,
+                    "details": {"reason": "No indicator/data passed"},
+                }
+        except Exception as e:
+            factor_scores["support_resistance"] = {
+                "score": 0.0, "confidence": 0.0, "block_trade": False,
+                "scenario": "MID_RANGE",
+                "suggested_stop": None, "suggested_target": None,
+                "suggested_leverage": 10.0,
+                "details": {"err": str(e)},
             }
 
         # --- Hard vetoes (block_trade = both directions) ---
@@ -189,6 +217,9 @@ class MultiFactorAggregator:
             block_trade, block_long_only, block_reason, elapsed,
         )
 
+        # Extract S/R suggestions to return alongside consensus
+        sr_fs = factor_scores.get("support_resistance", {})
+
         return {
             "signal":          consensus_signal,
             "final_score":     round(final_score, 3),
@@ -197,6 +228,11 @@ class MultiFactorAggregator:
             "block_reason":    block_reason,
             "factor_scores":   factor_scores,
             "elapsed_s":       round(elapsed, 1),
+            # S/R pass-through for stop/target/leverage in futures.py
+            "sr_scenario":         sr_fs.get("scenario", "MID_RANGE"),
+            "sr_suggested_stop":   sr_fs.get("suggested_stop"),
+            "sr_suggested_target": sr_fs.get("suggested_target"),
+            "sr_suggested_leverage": sr_fs.get("suggested_leverage", 10.0),
         }
 
     # -----------------------------------------------------------------------
@@ -236,7 +272,8 @@ class MultiFactorAggregator:
             w        = WEIGHTS.get(name, 0.0)
             arrow    = "▲" if s > 0 else ("▼" if s < 0 else "─")
             flag     = "  🚫LONG-ONLY" if (name == "news" and fs.get("block_long_only")) else ""
-            print(f"  {name:<12} score={s:+.3f}  conf={c:.2f}  wt={w:.2f}  {arrow}{flag}")
+            scenario = f"  [{fs['scenario']}]" if name == "support_resistance" and "scenario" in fs else ""
+            print(f"  {name:<20} score={s:+.3f}  conf={c:.2f}  wt={w:.2f}  {arrow}{flag}{scenario}")
         print(f"  {'─'*51}")
         print(f"  Final score : {final_score:+.3f}")
         if blocked:

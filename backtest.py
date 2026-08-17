@@ -26,6 +26,7 @@ import pandas as pd
 import requests
 import talib
 from datetime import datetime, timezone, timedelta
+from factors.support_resistance import detect_sr_levels_from_arrays
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_MKT_URL   = "https://api.bybit.com/v5/market"
@@ -53,8 +54,9 @@ CONTRACT_SPECS = {
 }
 
 # ---- Multi-factor weights (mirrors factors/aggregator.py) ----
-MF_WEIGHTS          = {"regime": 0.30, "derivatives": 0.25,
-                       "technical": 0.20, "sentiment": 0.15, "news": 0.10}
+MF_WEIGHTS          = {"regime": 0.25, "derivatives": 0.22,
+                       "technical": 0.20, "support_resistance": 0.15,
+                       "sentiment": 0.12, "news": 0.06}
 MF_LONG_THRESHOLD   = 0.10   # threshold for dataset generation
 MF_SHORT_THRESHOLD  = 0.10   # threshold for dataset generation
 
@@ -238,6 +240,7 @@ def compute_multi_factor_details(
     regime_scores: dict,
     funding_map: dict,
     fng_map: dict,
+    sr_res: dict = None,
 ) -> dict:
     """Compute weighted multi-factor scores and return detailed breakdown for logging."""
     bar_dt = pd.Timestamp(bar_time)
@@ -277,11 +280,15 @@ def compute_multi_factor_details(
     # 5. News
     news_score = 0.0
 
-    final = (MF_WEIGHTS["technical"]    * ta_score
-           + MF_WEIGHTS["regime"]       * regime_score
-           + MF_WEIGHTS["derivatives"]  * deriv_score
-           + MF_WEIGHTS["sentiment"]    * sentiment_score
-           + MF_WEIGHTS["news"]         * news_score)
+    # 6. S/R score
+    sr_score = sr_res.get("score", 0.0) if sr_res else 0.0
+
+    final = (MF_WEIGHTS["technical"]          * ta_score
+           + MF_WEIGHTS["regime"]             * regime_score
+           + MF_WEIGHTS["derivatives"]        * deriv_score
+           + MF_WEIGHTS["support_resistance"] * sr_score
+           + MF_WEIGHTS["sentiment"]          * sentiment_score
+           + MF_WEIGHTS["news"]               * news_score)
     final_score = max(-1.0, min(1.0, final))
 
     regime_class = "BULL" if regime_score > 0.3 else ("BEAR" if regime_score < -0.3 else "NEUTRAL")
@@ -293,6 +300,7 @@ def compute_multi_factor_details(
         "derivatives_score": round(deriv_score, 3),
         "sentiment_score":   round(sentiment_score, 3),
         "news_score":        round(news_score, 3),
+        "sr_score":          round(sr_score, 3),
         "regime_class":      regime_class,
         "funding_rate":      funding_rate,
     }
@@ -655,18 +663,26 @@ def run_multi_asset_backtest(symbols, start_ms, end_ms, starting_balance, no_fac
                 if not signal["signal"] or signal["strength"] < SIGNAL_STRENGTH_THRESHOLD:
                     continue
 
+                # Compute S/R levels
+                h1 = ind1h_df["high"].values[:idx1h + 1]
+                l1 = ind1h_df["low"].values[:idx1h + 1]
+                h4 = ind4h_df["high"].values[:idx4h + 1]
+                l4 = ind4h_df["low"].values[:idx4h + 1]
+                sr_res = detect_sr_levels_from_arrays(h1, l1, h4, l4, current_price)
+
                 # Multi-Factor Consensus Evaluation
                 if no_factors:
                     direction_ok = True
                     mf_details = {
                         "final_score": 0.0, "technical_score": 0.0, "regime_score": 0.0,
                         "derivatives_score": 0.0, "sentiment_score": 0.0, "news_score": 0.0,
-                        "regime_class": "NEUTRAL", "funding_rate": 0.0
+                        "sr_score": 0.0, "regime_class": "NEUTRAL", "funding_rate": 0.0
                     }
                 else:
                     mf_details = compute_multi_factor_details(
                         signal, t, b_idx1h, regime_scores,
-                        funding_maps.get(sym, {}), fng_map
+                        funding_maps.get(sym, {}), fng_map,
+                        sr_res=sr_res
                     )
                     mf_score = mf_details["final_score"]
                     direction_ok = (
@@ -682,10 +698,18 @@ def run_multi_asset_backtest(symbols, start_ms, end_ms, starting_balance, no_fac
                     best_score = score_abs
                     trend_4h = "BULL" if row4h["ema_21"] > row4h["ema_50"] else "BEAR"
 
-                    stop_loss, take_profit, _ = calculate_stops(
-                        signal["signal"], current_price, row15["atr"], row1h["atr"], signal["strength"]
-                    )
-                    sizing = calculate_position_size(sym, balance, current_price, stop_loss, signal["leverage"])
+                    trade_leverage = signal["leverage"]
+                    if sr_res.get("suggested_stop") and sr_res.get("suggested_target") and sr_res.get("scenario") != "MID_RANGE":
+                        stop_loss = sr_res["suggested_stop"]
+                        take_profit = sr_res["suggested_target"]
+                        if sr_res.get("suggested_leverage"):
+                            trade_leverage = sr_res["suggested_leverage"]
+                    else:
+                        stop_loss, take_profit, _ = calculate_stops(
+                            signal["signal"], current_price, row15["atr"], row1h["atr"], signal["strength"]
+                        )
+
+                    sizing = calculate_position_size(sym, balance, current_price, stop_loss, trade_leverage)
 
                     if sizing:
                         best_setup = {
@@ -710,6 +734,8 @@ def run_multi_asset_backtest(symbols, start_ms, end_ms, starting_balance, no_fac
                                 "derivatives_score":  mf_details["derivatives_score"],
                                 "sentiment_score":    mf_details["sentiment_score"],
                                 "news_score":         mf_details["news_score"],
+                                "sr_score":           mf_details.get("sr_score", 0.0),
+                                "sr_scenario":        sr_res.get("scenario", "MID_RANGE"),
                                 "regime_class":       mf_details["regime_class"],
                                 "funding_rate":       mf_details["funding_rate"],
                                 "market_trend_4h":    trend_4h,
