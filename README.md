@@ -93,7 +93,6 @@ Create a `.env` file in the project root:
 ```env
 API_KEY=your_bybit_api_key
 API_SECRET=your_bybit_api_secret
-CRYPTOPANIC_TOKEN=optional_cryptopanic_token
 ```
 
 ### 3. Execution Commands
