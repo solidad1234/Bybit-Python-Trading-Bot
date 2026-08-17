@@ -16,6 +16,7 @@ import os
 import json
 import sqlite3
 from factors.aggregator import MultiFactorAggregator
+from factors.regime import get_regime_score
 
 # Load environment variables
 load_dotenv()
@@ -24,6 +25,18 @@ api_secret = os.getenv("API_SECRET")
 
 # Trading Configuration
 TRADE_SYMBOLS = ["SOLUSDT", "ETHUSDT", "AVAXUSDT", "LINKUSDT", "BNBUSDT"]
+
+# Per-symbol Bybit linear contract specs (last verified 2026-08)
+# min_qty  : minimum order size in base coin units
+# step_size: order size increment
+# ticker   : human-readable base coin label for log messages
+SYMBOL_CONTRACT_SPECS = {
+    "SOLUSDT":  {"min_qty": 0.1,  "step_size": 0.1,  "ticker": "SOL"},
+    "ETHUSDT":  {"min_qty": 0.01, "step_size": 0.01, "ticker": "ETH"},
+    "AVAXUSDT": {"min_qty": 0.1,  "step_size": 0.1,  "ticker": "AVAX"},
+    "LINKUSDT": {"min_qty": 0.1,  "step_size": 0.1,  "ticker": "LINK"},
+    "BNBUSDT":  {"min_qty": 0.01, "step_size": 0.01, "ticker": "BNB"},
+}
 primary_timeframe = "15"   # Primary analysis
 higher_timeframe = "60"    # Trend confirmation
 
@@ -104,6 +117,7 @@ class FuturesTradingBot:
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_training_data (
                 id INTEGER PRIMARY KEY,
+                symbol TEXT,
                 timestamp TEXT,
                 current_price REAL,
                 rsi_15m REAL,
@@ -219,9 +233,14 @@ class FuturesTradingBot:
         if row:
             columns = [col[0] for col in self.cursor.description]
             row_dict = dict(zip(columns, row))
+            recovered_symbol = row_dict.get('symbol')
+            if not recovered_symbol:
+                print("⚠️ DB recovery: position record has no symbol. Clearing stale state.")
+                self.clear_position_state()
+                return
             print(f"🔄 Recovering active position from database...")
             futures_state['position'] = {
-                'symbol': row_dict.get('symbol') or TRADE_SYMBOLS[0],
+                'symbol': recovered_symbol,
                 'direction': row_dict.get('direction'),
                 'size': row_dict.get('size'),
                 'entry': row_dict.get('entry'),
@@ -314,16 +333,17 @@ class FuturesTradingBot:
             pos['timestamp'] = datetime.fromisoformat(pos['timestamp'])
         return pos
 
-    def log_features(self, current_price, indicators, btc_data, volatility):
-        """Log features for AI training"""
+    def log_features(self, symbol, current_price, indicators, btc_data, volatility):
+        """Log features for AI training (symbol column added for multi-asset ML)"""
         try:
             self.cursor.execute('''
                 INSERT INTO ai_training_data (
-                    timestamp, current_price, rsi_15m, rsi_1h, macd_15m, 
-                    macd_hist_15m, adx_15m, adx_1h, volatility, 
+                    symbol, timestamp, current_price, rsi_15m, rsi_1h, macd_15m,
+                    macd_hist_15m, adx_15m, adx_1h, volatility,
                     btc_1h_change, btc_4h_change, volume_ratio_15m
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
+                symbol,
                 datetime.now().isoformat(),
                 current_price,
                 indicators['15m']['rsi'],
@@ -648,83 +668,75 @@ class FuturesTradingBot:
 
         return {"signal": None, "strength": max(long_score, short_score)}
     
-    def calculate_futures_position_size(self, entry_price, stop_loss_price, leverage=10.0):
-        """Calculate safe futures position size with proper USDT margin validation"""
-        
+    def calculate_futures_position_size(self, entry_price, stop_loss_price,
+                                        leverage=10.0, symbol="SOLUSDT"):
+        """Calculate safe futures position size with symbol-aware lot constraints."""
+
+        specs = SYMBOL_CONTRACT_SPECS.get(symbol, SYMBOL_CONTRACT_SPECS["SOLUSDT"])
+        min_order_size = specs["min_qty"]
+        step_size      = specs["step_size"]
+        ticker         = specs["ticker"]
+
         usdt_balance = self.get_usdt_balance()
-        
+
         print(f"💰 Margin Check:")
         print(f"   Available USDT: ${usdt_balance:.2f}")
-        
-        # Check if we have sufficient USDT margin
+
         if usdt_balance < 5:
             print(f"❌ Insufficient USDT for futures margin: ${usdt_balance:.2f} (minimum $5)")
             return None
-        
-        # Use conservative margin - max 70% of available USDT for safety
+
         max_usable_margin = usdt_balance * 0.7
-        risk_amount = usdt_balance * futures_risk_per_trade  # 5% of USDT balance
-        
-        # Distance to stop loss
+        risk_amount       = usdt_balance * futures_risk_per_trade
+
         stop_distance = abs(entry_price - stop_loss_price)
         if stop_distance <= 0:
             print("❌ Invalid stop loss distance")
             return None
-        
-        # Calculate position size based on available margin
+
         max_position_by_margin = (max_usable_margin * leverage) / entry_price
-        
-        # Calculate position size based on risk (DO NOT multiply by leverage)
-        max_position_by_risk = risk_amount / stop_distance
-        
-        # Use the smaller of the two for safety
-        position_size = min(max_position_by_margin, max_position_by_risk)
-        
-        # Apply Bybit futures requirements for SOLUSDT
-        min_order_size = 0.1  # Minimum 0.1 SOL for futures
-        step_size = 0.1       # Must be in increments of 0.1
-        
+        max_position_by_risk   = risk_amount / stop_distance
+        position_size          = min(max_position_by_margin, max_position_by_risk)
+
         if position_size < min_order_size:
-            print(f"⚠️ Calculated position ({position_size:.4f}) below minimum ({min_order_size})")
+            print(f"⚠️ Calculated position ({position_size:.4f}) below minimum ({min_order_size}) — using minimum")
             position_size = min_order_size
         else:
             position_size = round(position_size / step_size) * step_size
-            print(f"📊 Rounded position to step size: {position_size:.1f} SOL")
-        
-        # Calculate required margin
+            print(f"📊 Rounded position to step size: {position_size} {ticker}")
+
         required_margin = (position_size * entry_price) / leverage
-        
-        # Final validation
+
         if required_margin > max_usable_margin:
             print(f"⚠️ Required margin ${required_margin:.2f} exceeds available ${max_usable_margin:.2f}")
-            position_size = (max_usable_margin * leverage) / entry_price
-            position_size = round(position_size / step_size) * step_size
+            position_size   = (max_usable_margin * leverage) / entry_price
+            position_size   = round(position_size / step_size) * step_size
             required_margin = (position_size * entry_price) / leverage
-            
             if position_size < min_order_size:
-                print(f"❌ Even reduced position ({position_size:.1f}) below minimum")
+                print(f"❌ Even reduced position ({position_size}) below minimum ({min_order_size})")
                 return None
-        
+
         if required_margin < 2:
             print(f"❌ Margin too small: ${required_margin:.2f} (min: $2)")
             return None
-        
+
         actual_risk = position_size * stop_distance
-        
-        print(f"📊 Position Size Calculation:")
-        print(f"   Max Usable (50%): ${max_usable_margin:.2f}")
+
+        print(f"📊 Position Size Calculation ({symbol}):")
+        print(f"   Max Usable (70%): ${max_usable_margin:.2f}")
         print(f"   Risk Amount ({futures_risk_per_trade*100:.0f}%): ${risk_amount:.2f}")
-        print(f"   Stop Distance: ${stop_distance:.2f}")
-        print(f"   Position Size: {position_size:.1f} SOL")
+        print(f"   Stop Distance: ${stop_distance:.4f}")
+        print(f"   Position Size: {position_size} {ticker}")
         print(f"   Required Margin: ${required_margin:.2f}")
         print(f"   Actual Risk: ${actual_risk:.2f}")
-        
+
         return {
-            'position_size': round(position_size, 1),
+            'position_size':   position_size,
             'required_margin': round(required_margin, 2),
-            'leverage': leverage,
-            'risk_amount': risk_amount,
-            'actual_risk': actual_risk
+            'leverage':        leverage,
+            'risk_amount':     risk_amount,
+            'actual_risk':     actual_risk,
+            'ticker':          ticker,
         }
     
     def calculate_improved_futures_stops(self, direction, current_price, indicators, signal_strength):
@@ -789,8 +801,14 @@ class FuturesTradingBot:
     def place_futures_order(self, signal, current_price, indicators, factor_context=None, symbol_override=None):
         """Place futures order with improved stops. factor_context holds all
         multi-factor scores collected at signal time for logging."""
-        
-        trade_sym = symbol_override if symbol_override else TRADE_SYMBOLS[0]
+
+        if not symbol_override:
+            raise ValueError(
+                "place_futures_order() called without symbol_override. "
+                "Always pass symbol_override explicitly to prevent silent SOLUSDT fallback."
+            )
+        trade_sym = symbol_override
+        ticker    = SYMBOL_CONTRACT_SPECS.get(trade_sym, {}).get("ticker", trade_sym)
         
         # Calculate improved stops
         stop_data = self.calculate_improved_futures_stops(
@@ -808,9 +826,9 @@ class FuturesTradingBot:
         print(f"   Reward: ${stop_data['reward_amount']:.2f}")
         print(f"   Ratio: {stop_data['reward_ratio']:.2f}:1")
         
-        # Calculate position size
+        # Calculate position size (symbol-aware lot constraints)
         position_data = self.calculate_futures_position_size(
-            current_price, stop_loss, signal["leverage"]
+            current_price, stop_loss, signal["leverage"], symbol=trade_sym
         )
         
         if position_data is None:
@@ -853,13 +871,13 @@ class FuturesTradingBot:
                 "tpTriggerBy": "MarkPrice",
             }
             
-            print(f"\n🚀 FUTURES {signal['signal']} Order:")
+            print(f"\n🚀 FUTURES {signal['signal']} Order ({trade_sym}):")
             print(f"   💰 Margin: ${position_data['required_margin']:.2f}")
-            print(f"   📊 Position: {position_data['position_size']:.1f} SOL")
+            print(f"   📊 Position: {position_data['position_size']} {ticker}")
             print(f"   ⚡ Leverage: {signal['leverage']:.1f}x")
-            print(f"   🎯 Entry: ${current_price:.2f}")
-            print(f"   🛡️ Stop: ${stop_loss:.2f} (atomic, mark-price triggered)")
-            print(f"   💎 Target: ${take_profit:.2f} (atomic, mark-price triggered)")
+            print(f"   🎯 Entry: ${current_price:.4f}")
+            print(f"   🛡️ Stop: ${stop_loss:.4f} (atomic, mark-price triggered)")
+            print(f"   💎 Target: ${take_profit:.4f} (atomic, mark-price triggered)")
             print(f"   💀 Max Risk: ${position_data['actual_risk']:.2f}")
             
             result = session.place_order(**order_params)
@@ -1102,28 +1120,35 @@ class FuturesTradingBot:
         else:  # LONG
             pnl_pct = (current_price - entry_price) / entry_price
         
+        # Symbol-aware lot constraints
+        sym    = position.get('symbol', 'SOLUSDT')
+        specs  = SYMBOL_CONTRACT_SPECS.get(sym, SYMBOL_CONTRACT_SPECS['SOLUSDT'])
+        min_q  = specs['min_qty']
+        step_q = specs['step_size']
+        ticker = specs['ticker']
+
         # Take 25% profit at 2% gain (halfway to the 2:1 target)
         if pnl_pct >= 0.02 and not position.get('exit_25_taken'):
-            partial_qty = round(position['size'] * 0.25, 1)
-            if partial_qty < 0.1:
-                partial_qty = 0.1  # Bybit minimum
-            print(f"💰 Placing 25% partial close ({partial_qty:.1f} SOL) at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
+            partial_qty = round(position['size'] * 0.25 / step_q) * step_q
+            if partial_qty < min_q:
+                partial_qty = min_q
+            print(f"💰 Placing 25% partial close ({partial_qty} {ticker}) at ${current_price:.4f} (+{pnl_pct*100:.1f}%)")
             if self._place_reduce_only_order(direction, partial_qty):
-                position['size'] = round(position['size'] - partial_qty, 1)
+                position['size'] = round((position['size'] - partial_qty) / step_q) * step_q
                 position['exit_25_taken'] = True
-                print(f"✅ 25% partial closed — remaining size: {position['size']:.1f} SOL")
+                print(f"✅ 25% partial closed — remaining size: {position['size']} {ticker}")
                 self.save_position_state()
-        
+
         # Take another 25% at 3.5% gain (just before the 2:1 TP at ~4%)
         if pnl_pct >= 0.035 and not position.get('exit_50_taken'):
-            partial_qty = round(position['size'] * 0.25, 1)
-            if partial_qty < 0.1:
-                partial_qty = 0.1
-            print(f"💰 Placing second 25% partial ({partial_qty:.1f} SOL) at ${current_price:.2f} (+{pnl_pct*100:.1f}%)")
+            partial_qty = round(position['size'] * 0.25 / step_q) * step_q
+            if partial_qty < min_q:
+                partial_qty = min_q
+            print(f"💰 Placing second 25% partial ({partial_qty} {ticker}) at ${current_price:.4f} (+{pnl_pct*100:.1f}%)")
             if self._place_reduce_only_order(direction, partial_qty):
-                position['size'] = round(position['size'] - partial_qty, 1)
+                position['size'] = round((position['size'] - partial_qty) / step_q) * step_q
                 position['exit_50_taken'] = True
-                print(f"✅ 50% total closed — remaining size: {position['size']:.1f} SOL")
+                print(f"✅ 50% total closed — remaining size: {position['size']} {ticker}")
                 self.save_position_state()
         
         # Move stop to breakeven after first partial (risk-free remainder)
@@ -1230,43 +1255,47 @@ class FuturesTradingBot:
 
         print(f"🔍 Scanning Universe: {', '.join(TRADE_SYMBOLS)}")
 
+        # ── Pre-loop: fetch market-wide signals ONCE (avoids 5× redundant API calls) ──
+        btc_data = self.check_btc_correlation()
+        try:
+            regime_info = get_regime_score()
+        except Exception:
+            regime_info = {"score": 0.0, "confidence": 0.0, "block_trade": False,
+                           "regime": "NEUTRAL", "details": {}}
+        regime_score_global = regime_info.get("score", 0.0)
+        precomputed         = {"regime": regime_info}   # passed to aggregator for every symbol
+
+        aggregator = MultiFactorAggregator()
+
         for current_sym in TRADE_SYMBOLS:
             print(f"\n📊 Analyzing {current_sym}...")
-            
+
             data = self.fetch_multi_timeframe_data(current_sym)
             if not data:
                 print(f"   ❌ Failed to fetch data")
                 continue
-            
+
             indicators, current_price, volatility = self.calculate_indicators(data)
-            btc_data = self.check_btc_correlation()  # Uses global BTCUSDT
-            
+
             # Regime Filter: Block if flat
             if indicators['1h']['adx'] < 18:
                 print(f"   🚫 Flat market (1h ADX: {indicators['1h']['adx']:.1f} < 18)")
                 continue
 
-            aggregator = MultiFactorAggregator()
-            
-            # Get regime score directly for dynamic threshold
-            try:
-                from factors.regime import get_regime_score
-                regime_info = get_regime_score()
-                regime_score = regime_info.get("score", 0.0)
-            except:
-                regime_score = 0.0
+            signal = self.calculate_futures_signals(
+                indicators, current_price, volatility, regime_score=regime_score_global
+            )
 
-            signal = self.calculate_futures_signals(indicators, current_price, volatility, regime_score=regime_score)
-            
             if signal["signal"] not in ["LONG", "SHORT"] or signal["strength"] < signal_strength_threshold:
                 continue
 
             if signal["signal"] == "LONG" and btc_data['bearish']:
-                print("   ❌ BTC bearish - skipping LONG")
+                print("   ❌ BTC bearish — skipping LONG")
                 continue
 
-            # Full multi-factor evaluation
-            consensus = aggregator.evaluate(signal, current_sym, current_price)
+            # Full multi-factor evaluation (regime pre-fetched, sentiment uses 1h cache)
+            consensus = aggregator.evaluate(signal, current_sym, current_price,
+                                            precomputed=precomputed)
             if consensus["block_trade"] or consensus["signal"] is None:
                 continue
 
