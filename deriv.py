@@ -123,9 +123,9 @@ macro_timeframe   = "4h"
 # forex_risk_per_trade: fraction of balance used as stake per trade.
 # 1.0 = 100% of balance as stake (use full deposit). Min Deriv stake is $1.00.
 # Deriv Multiplier x100 means $10 stake controls $1000 position (10% margin).
-forex_risk_per_trade     = 1.0    # 100% of balance per trade (entire deposit)
+forex_risk_per_trade     = 0.1    # 10% of balance per trade (entire deposit)
 max_spread_pips          = 2.5    # Max allowed broker spread in pips
-min_reward_ratio         = 1.5    # 1.5:1 R:R target for Forex intraday
+min_reward_ratio         = 2.5    # 1.5:1 R:R target for Forex intraday
 min_volatility_threshold = 0.0010 # Minimum volatility required
 
 # Multi-Factor Consensus Weights
