@@ -917,7 +917,12 @@ class DerivForexBot:
                 self.save_position_state()
                 print(f" 🛡️ [{symbol}] Stop moved to BREAK-EVEN at {pos['stop']:.5f}")
 
-            if current_price <= stop:
+            if pos.get('stop_moved_to_be'):
+                stop_threshold = pos['stop']
+            else:
+                stop_threshold = pos['stop']
+
+            if current_price <= stop_threshold:
                 self.close_position(current_price, "STOP_LOSS")
             elif current_price >= target:
                 self.close_position(current_price, "TAKE_PROFIT")
@@ -932,7 +937,12 @@ class DerivForexBot:
                 self.save_position_state()
                 print(f" 🛡️ [{symbol}] Stop moved to BREAK-EVEN at {pos['stop']:.5f}")
 
-            if current_price >= stop:
+            if pos.get('stop_moved_to_be'):
+                stop_threshold = pos['stop']
+            else:
+                stop_threshold = pos['stop']
+
+            if current_price >= stop_threshold:
                 self.close_position(current_price, "STOP_LOSS")
             elif current_price <= target:
                 self.close_position(current_price, "TAKE_PROFIT")
