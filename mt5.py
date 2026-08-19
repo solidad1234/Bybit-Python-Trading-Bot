@@ -63,13 +63,19 @@ MT5_PATH = os.getenv("MT5_PATH", "")
 TRADE_SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD"]
 
 # Per-symbol Forex specs (pip size, lot step, min lot, contract size)
+# quote_is_usd=True  → quote currency is USD (pip value = contract_size * pip_size)
+# quote_is_usd=False → quote currency is NOT USD (pip value must be divided by current price)
 SYMBOL_SPECS = {
-    "EURUSD": {"pip_size": 0.0001, "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000},
-    "GBPUSD": {"pip_size": 0.0001, "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000},
-    "USDJPY": {"pip_size": 0.01,   "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000},
-    "AUDUSD": {"pip_size": 0.0001, "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000},
-    "USDCAD": {"pip_size": 0.0001, "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000},
+    "EURUSD": {"pip_size": 0.0001, "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000, "quote_is_usd": True},
+    "GBPUSD": {"pip_size": 0.0001, "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000, "quote_is_usd": True},
+    "USDJPY": {"pip_size": 0.01,   "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000, "quote_is_usd": False},
+    "AUDUSD": {"pip_size": 0.0001, "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000, "quote_is_usd": True},
+    "USDCAD": {"pip_size": 0.0001, "min_lot": 0.01, "lot_step": 0.01, "contract_size": 100000, "quote_is_usd": False},
 }
+
+# Bot-level constants
+BOT_MAGIC_NUMBER   = 998877  # Unique magic number to identify this bot's orders in MT5
+MAX_DAILY_LOSS_PCT = 0.05    # Halt trading if session PnL drops more than 5% of start balance
 
 # Forex Google News Query Mapping
 FOREX_NEWS_QUERIES = {
@@ -130,7 +136,7 @@ bot_state = {
     'max_consecutive_losses': 3,
     'session_start': datetime.now(timezone.utc),
     'available_balance': 1000.0,
-    'session_start_balance': 1000.0,
+    'session_start_balance': 0.0,  # Set to 0.0 as sentinel — populated on first balance fetch
     'session_pnl': 0.0,
 }
 
@@ -242,6 +248,29 @@ class MT5ForexBot:
                 session_window     TEXT
             )
         ''')
+
+        # --- Schema migrations: safely add columns missing from older DB files ---
+        _migrations = [
+            ("trade_log", "news_score",         "REAL"),
+            ("trade_log", "sr_scenario",        "TEXT"),
+            ("trade_log", "session_window",      "TEXT"),
+            ("trade_log", "ta_signal_strength",  "REAL"),
+            ("trade_log", "spread_pips",         "REAL"),
+            ("trade_log", "volatility",          "REAL"),
+            ("trade_log", "atr_15m",             "REAL"),
+        ]
+        existing_cols = {}
+        for tbl in ("trade_log", "position"):
+            self.cursor.execute(f"PRAGMA table_info({tbl})")
+            existing_cols[tbl] = {row[1] for row in self.cursor.fetchall()}
+        for tbl, col, col_type in _migrations:
+            if col not in existing_cols.get(tbl, set()):
+                try:
+                    self.cursor.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_type}")
+                    print(f"🔧 DB migration: added column '{col}' to table '{tbl}'")
+                except Exception as mig_err:
+                    print(f"⚠️ DB migration notice for {tbl}.{col}: {mig_err}")
+
         self.conn.commit()
 
     def init_mt5_connection(self):
@@ -295,7 +324,7 @@ class MT5ForexBot:
                 print(f"⚠️ Could not fetch MT5 account info: {e}")
 
         bot_state['available_balance'] = balance
-        if bot_state['session_start_balance'] == 0:
+        if bot_state['session_start_balance'] == 0.0:  # Only set once per session (sentinel check)
             bot_state['session_start_balance'] = balance
 
         print(f"💰 Forex Balance Initialized:")
@@ -380,6 +409,10 @@ class MT5ForexBot:
         # 2. Active Session Window Check (07:00 - 16:30 UTC)
         in_session = (london_open_utc <= utc_hour_float <= ny_close_utc)
         session_label = "LONDON_NY_OVERLAP" if in_session else "OUT_OF_SESSION"
+
+        if not in_session:
+            print(f" 🚫 BLOCKED: Outside London/NY session ({utc_hour_float:.2f} UTC). Active window: 07:00–16:30 UTC.")
+            return False, "OUT_OF_SESSION", 0.0
 
         # 3. Real-Time Spread Check
         pip_size = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
@@ -470,27 +503,76 @@ class MT5ForexBot:
                 stoch_k, stoch_d = talib.STOCH(highs, lows, closes, fastk_period=14, slowk_period=3, slowd_period=3)
                 volume_sma = talib.SMA(volumes, timeperiod=20)[-1]
             else:
+                # --- Helper: proper exponential moving average ---
+                def _ema(arr, n):
+                    k = 2.0 / (n + 1)
+                    val = float(np.mean(arr[:n]))
+                    for v in arr[n:]:
+                        val = float(v) * k + val * (1.0 - k)
+                    return val
+
+                # --- Wilder's RSI (exponential smoothing, not simple average) ---
                 diff = np.diff(closes)
-                gains = np.where(diff > 0, diff, 0)
-                losses = np.where(diff < 0, -diff, 0)
-                avg_gain = np.mean(gains[-14:])
-                avg_loss = np.mean(losses[-14:])
+                gains = np.where(diff > 0, diff, 0.0)
+                losses = np.where(diff < 0, -diff, 0.0)
+                rsi_period = 14
+                avg_gain = float(np.mean(gains[:rsi_period]))
+                avg_loss = float(np.mean(losses[:rsi_period]))
+                for i in range(rsi_period, len(gains)):
+                    avg_gain = (avg_gain * (rsi_period - 1) + gains[i]) / rsi_period
+                    avg_loss = (avg_loss * (rsi_period - 1) + losses[i]) / rsi_period
                 rs = avg_gain / (avg_loss + 1e-9)
-                rsi = 100 - (100 / (1 + rs))
+                rsi = 100.0 - (100.0 / (1.0 + rs))
 
-                ema_21 = np.mean(closes[-21:])
-                ema_50 = np.mean(closes[-50:])
-                macd_line_val = ema_21 - ema_50
-                macd_signal_val = macd_line_val * 0.8
+                # --- Proper EMA values ---
+                ema_21 = _ema(closes, 21)
+                ema_50 = _ema(closes, 50)
+
+                # --- Proper MACD: EMA12 - EMA26, Signal = EMA9 of MACD line ---
+                ema_12 = _ema(closes, 12)
+                ema_26 = _ema(closes, 26)
+                macd_line_val = ema_12 - ema_26
+                # Build enough MACD history to compute 9-period signal EMA
+                start_idx = max(26, len(closes) - 20)
+                macd_vals = [_ema(closes[:i + 1], 12) - _ema(closes[:i + 1], 26)
+                             for i in range(start_idx, len(closes))]
+                macd_signal_val = _ema(np.array(macd_vals), 9) if len(macd_vals) >= 9 else macd_vals[-1]
                 macd_hist_val = macd_line_val - macd_signal_val
-                macd_line = np.array([macd_line_val])
+                macd_line   = np.array([macd_line_val])
                 macd_signal = np.array([macd_signal_val])
-                macd_hist = np.array([macd_hist_val])
+                macd_hist   = np.array([macd_hist_val])
 
-                tr = np.maximum(highs[-14:] - lows[-14:], np.abs(highs[-14:] - closes[-15:-1]))
-                atr = np.mean(tr)
-                adx = 22.0
-                stoch_k, stoch_d = np.array([70.0]), np.array([65.0])
+                # --- ATR: proper True Range (Wilder's smoothing) ---
+                tr_arr = np.maximum(
+                    highs[1:] - lows[1:],
+                    np.maximum(np.abs(highs[1:] - closes[:-1]),
+                               np.abs(lows[1:]  - closes[:-1]))
+                )
+                atr_period = 14
+                atr = float(np.mean(tr_arr[:atr_period]))
+                for v in tr_arr[atr_period:]:
+                    atr = (atr * (atr_period - 1) + float(v)) / atr_period
+
+                # --- Stochastic %K / %D from actual high/low range ---
+                stoch_period = 14
+                recent_high = float(np.max(highs[-stoch_period:]))
+                recent_low  = float(np.min(lows[-stoch_period:]))
+                stoch_k_val = ((float(closes[-1]) - recent_low) /
+                               (recent_high - recent_low + 1e-9)) * 100.0
+                stoch_k = np.array([stoch_k_val])
+                stoch_d = np.array([stoch_k_val])  # Simplified: no 3-bar smoothing history
+
+                # --- ADX: directional movement index (simplified single-window DX) ---
+                dm_plus  = np.where((highs[1:] - highs[:-1]) > (lows[:-1] - lows[1:]),
+                                    np.maximum(highs[1:] - highs[:-1], 0.0), 0.0)
+                dm_minus = np.where((lows[:-1] - lows[1:]) > (highs[1:] - highs[:-1]),
+                                    np.maximum(lows[:-1] - lows[1:], 0.0), 0.0)
+                atr_window = np.mean(tr_arr[-atr_period:])
+                di_plus  = 100.0 * np.mean(dm_plus[-atr_period:])  / (atr_window + 1e-9)
+                di_minus = 100.0 * np.mean(dm_minus[-atr_period:]) / (atr_window + 1e-9)
+                dx = 100.0 * abs(di_plus - di_minus) / (di_plus + di_minus + 1e-9)
+                adx = dx  # Single DX bar as ADX proxy
+
                 volume_sma = np.mean(volumes[-20:])
 
             indicators[tf_name] = {
@@ -614,7 +696,14 @@ class MT5ForexBot:
             return None
 
         pip_distance = stop_distance / pip_size
-        pip_value_per_lot = contract_size * pip_size  # e.g., $10 per pip on EURUSD for 1.0 standard lot
+
+        # Pip value in USD depends on quote currency:
+        #   USD-quoted (EURUSD, GBPUSD, AUDUSD): pip_value = contract_size * pip_size  → ~$10/pip/lot
+        #   Non-USD quote (USDJPY, USDCAD):      pip_value = (contract_size * pip_size) / entry_price
+        if specs.get("quote_is_usd", True):
+            pip_value_per_lot = contract_size * pip_size
+        else:
+            pip_value_per_lot = (contract_size * pip_size) / entry_price
 
         raw_lots = risk_amount / (pip_distance * pip_value_per_lot)
         lots = round(raw_lots / lot_step) * lot_step
@@ -633,7 +722,7 @@ class MT5ForexBot:
             'pip_value': pip_value_per_lot * lots
         }
 
-    def execute_trade(self, symbol, direction, entry_price, indicators, signal_data):
+    def execute_trade(self, symbol, direction, entry_price, indicators, signal_data, spread_pips=0.0, volatility=0.0):
         """Execute Forex Trade (via MT5 or Dry-Run)"""
         pip_size = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
         atr_15m  = indicators["15m"]["atr"]
@@ -680,7 +769,7 @@ class MT5ForexBot:
                 "sl": stop_loss,
                 "tp": take_profit,
                 "deviation": 10,
-                "magic": 998877,
+                "magic": BOT_MAGIC_NUMBER,
                 "comment": "MT5 Forex Bot Signal",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
@@ -689,7 +778,8 @@ class MT5ForexBot:
             res = mt5.order_send(request)
             if res is not None and res.retcode == mt5.TRADE_RETCODE_DONE:
                 order_id = str(res.order)
-                print(f"✅ MT5 Order Successfully Placed! Order ID #{order_id}")
+                entry_price = float(res.price)  # Use actual MT5 fill price, not candle close
+                print(f"✅ MT5 Order Successfully Placed! Order ID #{order_id} | Fill: {entry_price:.5f}")
             else:
                 err_msg = mt5.last_error() if res is None else res.comment
                 print(f"❌ MT5 Order Execution Failed: {err_msg}")
@@ -709,7 +799,12 @@ class MT5ForexBot:
             'lowest_price': entry_price,
             'exit_25_taken': False,
             'exit_50_taken': False,
-            'stop_moved_to_be': False
+            'stop_moved_to_be': False,
+            # Runtime metadata (not persisted to DB — defaults to 0 on crash recovery)
+            'spread_pips': spread_pips,
+            'volatility': volatility,
+            'atr_15m': indicators["15m"]["atr"],
+            'news_score': 0.0,  # updated below if available
         }
         self.save_position_state()
 
@@ -781,9 +876,26 @@ class MT5ForexBot:
         pip_size   = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
 
         pips_earned = (exit_price - entry) / pip_size if direction == "LONG" else (entry - exit_price) / pip_size
-        pnl = pips_earned * (100000 * pip_size * lots)
 
-        # Log outcome
+        # Quote-currency-aware pip value (fixes USDJPY / USDCAD sizing)
+        specs = SYMBOL_SPECS.get(symbol, SYMBOL_SPECS["EURUSD"])
+        if specs.get("quote_is_usd", True):
+            pip_value_per_lot = specs["contract_size"] * pip_size
+        else:
+            pip_value_per_lot = (specs["contract_size"] * pip_size) / exit_price
+        pnl = pips_earned * pip_value_per_lot * lots
+
+        # Update win/loss counters and circuit breaker
+        bot_state['total_trades']  += 1
+        bot_state['session_pnl']   += pnl
+        bot_state['daily_trades']  += 1
+        if pnl > 0:
+            bot_state['winning_trades']    += 1
+            bot_state['consecutive_losses'] = 0
+        else:
+            bot_state['consecutive_losses'] += 1
+
+        # Log outcome with real metadata from position state
         try:
             self.cursor.execute('''
                 INSERT INTO trade_log (
@@ -791,15 +903,37 @@ class MT5ForexBot:
                     size, pnl, result, ta_signal_strength, spread_pips, volatility, atr_15m, news_score, sr_scenario, session_window
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                symbol, pos['timestamp'], datetime.now(timezone.utc).isoformat(),
-                direction, entry, exit_price, lots, pnl, reason, 5.0, 1.0, 0.002, 0.001, 0.0, "MID_RANGE", "LIVE"
+                symbol,
+                pos['timestamp'],
+                datetime.now(timezone.utc).isoformat(),
+                direction, entry, exit_price, lots, pnl, reason,
+                float(pos.get('strength', 0.0)),
+                float(pos.get('spread_pips', 0.0)),
+                float(pos.get('volatility', 0.0)),
+                float(pos.get('atr_15m', 0.0)),
+                float(pos.get('news_score', 0.0)),
+                str(pos.get('sr_scenario', 'UNKNOWN')),
+                'LIVE' if self.connected else 'DRY_RUN'
             ))
             self.conn.commit()
         except Exception as e:
             print(f"⚠️ Error logging trade outcome to SQLite: {e}")
 
         print(f" 🏁 POSITION CLOSED [{symbol}] — Reason: {reason} | Exit: {exit_price:.5f} | PnL: ${pnl:.2f} ({pips_earned:.1f} pips)")
+        win_rate = (bot_state['winning_trades'] / bot_state['total_trades'] * 100) if bot_state['total_trades'] > 0 else 0.0
+        print(f" 📊 Session Stats — Trades: {bot_state['total_trades']} | Win Rate: {win_rate:.0f}% | Session PnL: ${bot_state['session_pnl']:.2f} | Consec. Losses: {bot_state['consecutive_losses']}")
         self.clear_position_state()
+
+        # --- Daily Loss Killswitch ---
+        max_daily_loss = bot_state['session_start_balance'] * MAX_DAILY_LOSS_PCT
+        if bot_state['session_pnl'] < -max_daily_loss:
+            print(f"🛑 DAILY LOSS LIMIT HIT: Session PnL ${bot_state['session_pnl']:.2f} exceeded -{max_daily_loss:.2f} ({MAX_DAILY_LOSS_PCT*100:.0f}% of start balance). Bot halted for today.")
+            sys.exit(0)
+
+        # --- Consecutive-Loss Circuit Breaker ---
+        if bot_state['consecutive_losses'] >= bot_state['max_consecutive_losses']:
+            print(f"🛑 CIRCUIT BREAKER: {bot_state['consecutive_losses']} consecutive losses hit the limit of {bot_state['max_consecutive_losses']}. Bot halted.")
+            sys.exit(0)
 
     def run_cycle(self):
         """Single polling cycle across supported Forex symbols"""
@@ -808,11 +942,25 @@ class MT5ForexBot:
         # Handle open position management first
         if bot_state['position']:
             pos = bot_state['position']
-            data = self.fetch_multi_timeframe_data(pos['symbol'])
-            if data:
-                cur_price = data['15m']['close'][-1]
-                print(f" 📊 Open Position Active: {pos['direction']} {pos['symbol']} | Cur Price: {cur_price:.5f}")
+            symbol = pos['symbol']
+
+            # Use live bid/ask tick for position management (not stale candle close)
+            cur_price = None
+            if self.connected and HAS_MT5_LIB:
+                tick = mt5.symbol_info_tick(symbol)
+                if tick is not None:
+                    cur_price = tick.bid if pos['direction'] == 'LONG' else tick.ask
+
+            # Fallback: fetch candle data and use last close
+            if cur_price is None:
+                data = self.fetch_multi_timeframe_data(symbol)
+                cur_price = float(data['15m']['close'][-1]) if data else None
+
+            if cur_price is not None:
+                print(f" 📊 Open Position Active: {pos['direction']} {symbol} | Live Price: {cur_price:.5f}")
                 self.manage_position(cur_price)
+            else:
+                print(f" ⚠️ Could not fetch price for open position on {symbol}")
             return
 
         # Scan symbols for new entry signals
@@ -835,7 +983,7 @@ class MT5ForexBot:
 
             if signal in ["LONG", "SHORT"]:
                 print(f" ⚡ CONSENSUS SIGNAL DETECTED: {signal} on {symbol}")
-                success = self.execute_trade(symbol, signal, current_price, indicators, signal_data)
+                success = self.execute_trade(symbol, signal, current_price, indicators, signal_data, spread_pips, volatility)
                 if success:
                     break  # Execute one position per cycle max
 
