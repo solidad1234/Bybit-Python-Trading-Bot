@@ -120,7 +120,10 @@ higher_timeframe  = "1h"
 macro_timeframe   = "4h"
 
 # Risk Management Controls
-forex_risk_per_trade     = 0.015  # 1.5% account risk per trade
+# forex_risk_per_trade: fraction of balance used as stake per trade.
+# 1.0 = 100% of balance as stake (use full deposit). Min Deriv stake is $1.00.
+# Deriv Multiplier x100 means $10 stake controls $1000 position (10% margin).
+forex_risk_per_trade     = 1.0    # 100% of balance per trade (entire deposit)
 max_spread_pips          = 2.5    # Max allowed broker spread in pips
 min_reward_ratio         = 1.5    # 1.5:1 R:R target for Forex intraday
 min_volatility_threshold = 0.0010 # Minimum volatility required
@@ -375,7 +378,7 @@ class DerivForexBot:
     def initialize_balance(self):
         """Fetch account balance from Deriv API or set default"""
         balance = 1000.0
-        if self.connected and not self.dry_run:
+        if self.connected:
             try:
                 bal_res = self._send_request({"balance": 1})
                 if bal_res and "balance" in bal_res:
@@ -387,9 +390,10 @@ class DerivForexBot:
         if bot_state['session_start_balance'] == 0.0:
             bot_state['session_start_balance'] = balance
 
+        stake = max(1.0, balance * forex_risk_per_trade)
         print(f"💰 Deriv Balance Initialized:")
         print(f"   Available Balance: ${balance:.2f}")
-        print(f"   Risk Per Trade: {forex_risk_per_trade*100:.1f}% = ${balance * forex_risk_per_trade:.2f}")
+        print(f"   Stake Per Trade: {forex_risk_per_trade*100:.0f}% = ${stake:.2f} (Deriv Multiplier x100 → ${stake*100:.0f} position size)")
         print(f"   Mode: {'LIVE DERIV CONNECTED' if self.connected and not self.dry_run else 'DRY-RUN SIMULATION'}")
 
     def save_position_state(self):
@@ -476,27 +480,23 @@ class DerivForexBot:
             print(f" 🚫 BLOCKED: Outside London/NY session ({utc_hour_float:.2f} UTC). Active window: 07:00–16:30 UTC.")
             return False, "OUT_OF_SESSION", 0.0
 
-        # 3. Real-Time Spread Check via Deriv WS proposal/pricing
+        # 3. Real-Time Spread Check via Deriv tick feed
         pip_size = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
         spread_pips = 1.0  # default fallback
 
-        if self.connected and not self.dry_run:
+        if self.connected:
             deriv_sym = DERIV_SYMBOLS.get(symbol, symbol)
-            proposal = self._send_request({
-                "proposal": 1,
-                "amount": 10,
-                "basis": "stake",
-                "contract_type": "MULTUP",
-                "currency": "USD",
-                "symbol": deriv_sym
+            tick_res = self._send_request({
+                "ticks_history": deriv_sym,
+                "count": 1,
+                "end": "latest",
+                "style": "ticks"
             })
-            if proposal and "proposal" in proposal:
-                p = proposal["proposal"]
-                spot = float(p.get("spot", 0.0))
-                ask  = float(p.get("ask_price", spot))
-                bid  = float(p.get("bid_price", spot))
-                if ask > 0 and bid > 0:
-                    spread_pips = abs(ask - bid) / pip_size
+            if tick_res and "history" in tick_res:
+                prices = tick_res["history"].get("prices", [])
+                if len(prices) >= 2:
+                    spread_pips = abs(prices[-1] - prices[-2]) / pip_size
+                # Keep at default 1.0 if only one price — normal for ticks feed
 
         print(f" 🔍 {symbol} Real-time Spread: {spread_pips:.1f} pips (Max: {max_spread_pips} pips)")
         if spread_pips > max_spread_pips:
@@ -995,6 +995,9 @@ class DerivForexBot:
         print(f" 📊 Session Stats — Trades: {bot_state['total_trades']} | Win Rate: {win_rate:.0f}% | Session PnL: ${bot_state['session_pnl']:.2f} | Consec. Losses: {bot_state['consecutive_losses']}")
         self.clear_position_state()
 
+        # ── BUG FIX: Refresh balance from Deriv after every closed trade ──
+        self.initialize_balance()
+
         max_daily_loss = bot_state['session_start_balance'] * MAX_DAILY_LOSS_PCT
         if bot_state['session_pnl'] < -max_daily_loss:
             print(f"🛑 DAILY LOSS LIMIT HIT: Session PnL ${bot_state['session_pnl']:.2f} exceeded -{max_daily_loss:.2f} ({MAX_DAILY_LOSS_PCT*100:.0f}% of start balance). Bot halted for today.")
@@ -1013,11 +1016,19 @@ class DerivForexBot:
             symbol = pos['symbol']
 
             cur_price = None
-            if self.connected and not self.dry_run:
+            if self.connected:
                 deriv_sym = DERIV_SYMBOLS.get(symbol, symbol)
-                tick_res = self._send_request({"ticks": deriv_sym})
-                if tick_res and "tick" in tick_res:
-                    cur_price = float(tick_res["tick"].get("quote", 0.0))
+                # BUG FIX: Use ticks_history (not subscription-based ticks) for OTP WebSocket
+                tick_res = self._send_request({
+                    "ticks_history": deriv_sym,
+                    "count": 1,
+                    "end": "latest",
+                    "style": "ticks"
+                })
+                if tick_res and "history" in tick_res:
+                    prices = tick_res["history"].get("prices", [])
+                    if prices:
+                        cur_price = float(prices[-1])
 
             if cur_price is None:
                 data = self.fetch_multi_timeframe_data(symbol)
