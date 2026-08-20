@@ -115,6 +115,10 @@ NEGATIVE_KEYWORDS = {
     "slump", "deficit", "unemployment", "risk", "warning", "downside"
 }
 
+# News sentiment cache: {symbol: (cache_timestamp, score_dict)}
+_NEWS_CACHE: dict = {}
+NEWS_CACHE_TTL = 900  # 15 minutes — avoid hammering Google News RSS every cycle
+
 primary_timeframe = "15m"
 higher_timeframe  = "1h"
 macro_timeframe   = "4h"
@@ -156,13 +160,32 @@ bot_state = {
     'available_balance': 1000.0,
     'session_start_balance': 0.0,
     'session_pnl': 0.0,
+    # Graceful halt flag
+    'halt': False,
+    'halt_reason': '',
+    # Daily reset tracking
+    'last_reset_date': datetime.now(timezone.utc).date(),
 }
 
 
 def get_forex_news_score(symbol: str) -> dict:
-    """Fetch Google News RSS for USD Macro & Pair Specific Forex News"""
+    """Fetch Google News RSS for USD Macro & Pair Specific Forex News.
+    Results are cached per symbol for NEWS_CACHE_TTL seconds (15 min) to
+    avoid hammering Google's RSS endpoint every polling cycle.
+    """
+    now_ts = time.time()
+    # Return cached result if still fresh
+    if symbol in _NEWS_CACHE:
+        cache_time, cached_result = _NEWS_CACHE[symbol]
+        if now_ts - cache_time < NEWS_CACHE_TTL:
+            return cached_result
+
+    def _cache_and_return(result: dict) -> dict:
+        _NEWS_CACHE[symbol] = (now_ts, result)
+        return result
+
     if not HAS_FEEDPARSER:
-        return {"score": 0.0, "confidence": 0.0, "block_long_only": False, "details": {"reason": "feedparser not installed"}}
+        return _cache_and_return({"score": 0.0, "confidence": 0.0, "block_long_only": False, "details": {"reason": "feedparser not installed"}})
 
     try:
         macro_url = f"https://news.google.com/rss/search?q={quote_plus(FOREX_NEWS_QUERIES['MACRO'])}&hl=en-US&gl=US&ceid=US:en"
@@ -174,7 +197,7 @@ def get_forex_news_score(symbol: str) -> dict:
 
         entries = (macro_feed.entries[:5] if macro_feed.entries else []) + (pair_feed.entries[:5] if pair_feed.entries else [])
         if not entries:
-            return {"score": 0.0, "confidence": 0.2, "block_long_only": False, "details": {"reason": "No news found"}}
+            return _cache_and_return({"score": 0.0, "confidence": 0.2, "block_long_only": False, "details": {"reason": "No news found"}})
 
         net_score = 0.0
         for entry in entries:
@@ -188,15 +211,15 @@ def get_forex_news_score(symbol: str) -> dict:
         final_score = max(-1.0, min(1.0, net_score / len(entries)))
         block_long_only = final_score <= -0.5
 
-        return {
+        return _cache_and_return({
             "score": round(final_score, 3),
             "confidence": 0.70,
             "block_long_only": block_long_only,
             "block_reason": f"Negative Forex News Score ({final_score:.2f})" if block_long_only else "",
             "details": {"articles_count": len(entries), "score": round(final_score, 3)}
-        }
+        })
     except Exception as e:
-        return {"score": 0.0, "confidence": 0.0, "block_long_only": False, "details": {"err": str(e)}}
+        return _cache_and_return({"score": 0.0, "confidence": 0.0, "block_long_only": False, "details": {"err": str(e)}})
 
 
 class DerivForexBot:
@@ -225,8 +248,76 @@ class DerivForexBot:
             if response_str:
                 return json.loads(response_str)
         except Exception as e:
-            print(f"❌ Deriv WS request error ({payload.get('ticks_history') or list(payload.keys())[0]}): {e}")
+            print(f"\u274c Deriv WS request error ({payload.get('ticks_history') or list(payload.keys())[0]}): {e}")
+            self.connected = False   # Mark as disconnected so next cycle triggers reconnect
         return None
+
+    def _ensure_connected(self):
+        """Verify WebSocket is alive; reconnect with legacy auth if dropped.
+        Called at the top of every run_cycle() to guarantee live data.
+        """
+        if not HAS_WEBSOCKET or self.dry_run or not DERIV_API_TOKEN:
+            return
+        # Quick ping test
+        try:
+            if self.ws:
+                self.ws.settimeout(3.0)
+                self.ws.send(json.dumps({"ping": 1}))
+                pong = self.ws.recv()
+                if pong:
+                    self.connected = True
+                    return
+        except Exception:
+            self.connected = False
+
+        print("\u26a0\ufe0f WebSocket disconnected. Attempting reconnection...")
+        for attempt in range(1, 4):
+            try:
+                self.ws = websocket.create_connection(DERIV_WS_URL, timeout=10.0)
+                auth_res = self._send_request({"authorize": DERIV_API_TOKEN})
+                if auth_res and "authorize" in auth_res:
+                    self.connected = True
+                    print(f"\u2705 WebSocket reconnected successfully (attempt {attempt}).")
+                    return
+            except Exception as e:
+                print(f"\u26a0\ufe0f Reconnect attempt {attempt}/3 failed: {e}")
+                time.sleep(2)
+        print("\u274c Could not reconnect to Deriv WebSocket after 3 attempts. Data will not be live this cycle.")
+        self.connected = False
+
+    def _is_contract_open(self, contract_id: str) -> bool:
+        """Query Deriv portfolio to verify a contract is still active server-side.
+        Returns True if open (or unknown), False if already closed by Deriv.
+        """
+        if not self.connected or not contract_id or str(contract_id).startswith("DRY_RUN"):
+            return True  # Assume open for dry-run or unverifiable IDs
+        try:
+            portfolio_res = self._send_request({"portfolio": 1}, timeout=8.0)
+            if portfolio_res and "portfolio" in portfolio_res:
+                contracts = portfolio_res["portfolio"].get("contracts", [])
+                open_ids = {str(c.get("contract_id", "")) for c in contracts}
+                is_open = contract_id in open_ids
+                if not is_open:
+                    print(f" \u26a0\ufe0f Contract {contract_id} is no longer in Deriv portfolio — already closed server-side.")
+                return is_open
+        except Exception as e:
+            print(f" \u26a0\ufe0f Portfolio check error: {e}. Assuming contract is still open.")
+        return True  # Safe default: do not force-close if check fails
+
+    def _halt_bot(self, reason: str):
+        """Gracefully halt the bot: set flag, flush DB, close WebSocket."""
+        bot_state['halt'] = True
+        bot_state['halt_reason'] = reason
+        try:
+            self.conn.commit()
+            self.conn.close()
+        except Exception:
+            pass
+        try:
+            if self.ws:
+                self.ws.close()
+        except Exception:
+            pass
 
     def init_deriv_connection(self):
         """Establish WebSocket connection with Deriv API supporting both PAT (REST OTP) and legacy WS auth."""
@@ -361,6 +452,9 @@ class DerivForexBot:
             ("trade_log", "spread_pips",         "REAL"),
             ("trade_log", "volatility",          "REAL"),
             ("trade_log", "atr_15m",             "REAL"),
+            # NEW: Deriv multiplier contract tracking
+            ("position",  "stake_amount",        "REAL"),
+            ("position",  "multiplier",          "INTEGER"),
         ]
         existing_cols = {}
         for tbl in ("trade_log", "position"):
@@ -541,8 +635,13 @@ class DerivForexBot:
                 except Exception as e:
                     print(f"❌ Error fetching {tf_name} Deriv candles for {symbol}: {e}")
 
-            # Fallback simulated data generator for dry-run/testing
+            # Fallback simulated data generator for dry-run/testing ONLY
             if not fetched or tf_name not in data:
+                if self.connected and not self.dry_run:
+                    print(f"\u274c LIVE DATA FAILURE: Could not fetch {tf_name} candles for {symbol}. "
+                          f"Skipping this symbol to avoid trading on stale/fake data.")
+                    return {}  # Empty dict signals caller to skip this symbol
+                # Dry-run / testing: generate simulated data
                 np.random.seed(int(time.time() * 1000) % 100000)
                 base_prices = {"EURUSD": 1.0850, "GBPUSD": 1.2650, "USDJPY": 155.00, "AUDUSD": 0.6550, "USDCAD": 1.3550}
                 base_price = base_prices.get(symbol, 1.0000)
@@ -812,12 +911,20 @@ class DerivForexBot:
             return False
 
         lots = pos_size['lots']
+        # Compute stake before the live/dry-run split so it is always available
+        stake_amount = max(1.00, round(pos_size['risk_amount'], 2))
+        deriv_multiplier = 100
         order_id = f"DRY_RUN_{int(time.time())}"
 
         if self.connected and not self.dry_run:
             deriv_sym = DERIV_SYMBOLS.get(symbol, symbol)
             contract_type = "MULTUP" if direction == "LONG" else "MULTDOWN"
-            stake_amount = max(1.00, round(pos_size['risk_amount'], 2))
+
+            # FIX: Deriv multiplier limit_order uses dollar amounts, NOT prices or pips.
+            # stop_loss  = max loss in USD (capped at 90% of stake)
+            # take_profit = target gain in USD (R:R applied to max_loss)
+            max_loss_usd    = round(stake_amount * 0.9, 2)
+            take_profit_usd = round(max_loss_usd * min_reward_ratio, 2)
 
             # Request proposal from Deriv
             proposal_req = {
@@ -827,10 +934,10 @@ class DerivForexBot:
                 "contract_type": contract_type,
                 "currency": "USD",
                 "underlying_symbol": deriv_sym,
-                "multiplier": 100,
+                "multiplier": deriv_multiplier,
                 "limit_order": {
-                    "stop_loss": round(min(stake_amount * 0.9, stake_amount * (stop_pips / 100.0)), 2),
-                    "take_profit": round(stake_amount * (reward_pips / 100.0), 2)
+                    "stop_loss":   max_loss_usd,
+                    "take_profit": take_profit_usd
                 }
             }
             prop_res = self._send_request(proposal_req)
@@ -844,24 +951,24 @@ class DerivForexBot:
                 if buy_res and "buy" in buy_res:
                     order_id = str(buy_res["buy"].get("contract_id", order_id))
                     entry_price = float(buy_res["buy"].get("buy_price", entry_price))
-                    print(f"✅ Deriv Order Placed Successfully! Contract ID #{order_id} | Fill Price: {entry_price:.5f}")
+                    print(f"\u2705 Deriv Order Placed! Contract #{order_id} | Stake: ${stake_amount:.2f} | Fill: {entry_price:.5f} | SL: ${max_loss_usd:.2f} | TP: ${take_profit_usd:.2f}")
                 else:
                     err_info = buy_res.get("error", {}) if buy_res else {}
                     err_code = err_info.get("code", "UNKNOWN")
                     err_msg  = err_info.get("message", "No buy response")
-                    print(f"❌ Deriv Buy Execution Failed [{err_code}]: {err_msg}")
+                    print(f"\u274c Deriv Buy Execution Failed [{err_code}]: {err_msg}")
                     if "balance" in err_msg.lower() or err_code == "InsufficientBalance":
-                        print("💡 REASON: Insufficient funds in account to cover the trade stake.")
+                        print("\U0001f4a1 REASON: Insufficient funds in account to cover the trade stake.")
                     return False
             else:
                 err_info = prop_res.get("error", {}) if prop_res else {}
                 err_code = err_info.get("code", "UNKNOWN")
                 err_msg  = err_info.get("message", "No proposal response")
-                print(f"❌ Deriv Proposal Failed [{err_code}]: {err_msg}")
+                print(f"\u274c Deriv Proposal Failed [{err_code}]: {err_msg}")
                 if "balance" in err_msg.lower() or err_code == "InsufficientBalance":
-                    print(f"💡 REASON: Insufficient account balance (${bot_state['available_balance']:.2f}) for minimum stake (${stake_amount:.2f}).")
+                    print(f"\U0001f4a1 REASON: Insufficient account balance (${bot_state['available_balance']:.2f}) for minimum stake (${stake_amount:.2f}).")
                 elif "contract" in err_msg.lower() or "market" in err_msg.lower():
-                    print("💡 REASON: Market closed or contract parameter out of allowed bounds.")
+                    print("\U0001f4a1 REASON: Market closed or contract parameter out of allowed bounds.")
                 return False
 
         bot_state['position'] = {
@@ -884,25 +991,28 @@ class DerivForexBot:
             'atr_15m': indicators["15m"]["atr"],
             'news_score': signal_data.get("news_score", 0.0),
             'sr_scenario': signal_data.get("sr_scenario", "MID_RANGE"),
+            # Deriv contract details needed for correct PnL calculation
+            'stake_amount': stake_amount,
+            'multiplier': deriv_multiplier,
         }
         self.save_position_state()
 
         print(f" 🚀 {direction} POSITION OPENED [{symbol}]")
-        print(f"    Lots: {lots} | Entry: {entry_price:.5f} | SL: {stop_loss:.5f} ({stop_pips:.1f} pips) | TP: {take_profit:.5f} ({reward_pips:.1f} pips)")
+        print(f"    Stake: ${stake_amount:.2f} x{deriv_multiplier} | Entry: {entry_price:.5f} | SL: {stop_loss:.5f} | TP: {take_profit:.5f}")
         return True
 
     def manage_position(self, current_price):
-        """Manage active open position (Trailing stop & Break-even checks)"""
+        """Manage active open position: break-even move + ATR trailing stop."""
         pos = bot_state['position']
         if not pos:
             return
 
-        symbol     = pos['symbol']
-        direction  = pos['direction']
-        entry      = pos['entry']
-        stop       = pos['stop']
-        target     = pos['target']
-        pip_size   = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
+        symbol    = pos['symbol']
+        direction = pos['direction']
+        entry     = pos['entry']
+        target    = pos['target']
+        pip_size  = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
+        atr       = pos.get('atr_15m', 10 * pip_size)
 
         pos['highest_price'] = max(pos.get('highest_price', entry), current_price)
         pos['lowest_price']  = min(pos.get('lowest_price', entry), current_price)
@@ -911,18 +1021,22 @@ class DerivForexBot:
             profit_pips = (current_price - entry) / pip_size
             risk_pips   = (entry - pos['original_stop']) / pip_size
 
+            # Step 1: Move to break-even once 1:1 R:R is reached
             if profit_pips >= risk_pips and not pos.get('stop_moved_to_be'):
                 pos['stop'] = entry + (2.0 * pip_size)
                 pos['stop_moved_to_be'] = True
                 self.save_position_state()
                 print(f" 🛡️ [{symbol}] Stop moved to BREAK-EVEN at {pos['stop']:.5f}")
 
+            # Step 2: Trail at 1.5 ATR below the session high
             if pos.get('stop_moved_to_be'):
-                stop_threshold = pos['stop']
-            else:
-                stop_threshold = pos['stop']
+                trail_level = pos['highest_price'] - (1.5 * atr)
+                if trail_level > pos['stop']:
+                    pos['stop'] = trail_level
+                    self.save_position_state()
+                    print(f" 🔄 [{symbol}] Trailing stop raised to {pos['stop']:.5f}")
 
-            if current_price <= stop_threshold:
+            if current_price <= pos['stop']:
                 self.close_position(current_price, "STOP_LOSS")
             elif current_price >= target:
                 self.close_position(current_price, "TAKE_PROFIT")
@@ -937,36 +1051,39 @@ class DerivForexBot:
                 self.save_position_state()
                 print(f" 🛡️ [{symbol}] Stop moved to BREAK-EVEN at {pos['stop']:.5f}")
 
+            # Trail at 1.5 ATR above the session low
             if pos.get('stop_moved_to_be'):
-                stop_threshold = pos['stop']
-            else:
-                stop_threshold = pos['stop']
+                trail_level = pos['lowest_price'] + (1.5 * atr)
+                if trail_level < pos['stop']:
+                    pos['stop'] = trail_level
+                    self.save_position_state()
+                    print(f" 🔄 [{symbol}] Trailing stop lowered to {pos['stop']:.5f}")
 
-            if current_price >= stop_threshold:
+            if current_price >= pos['stop']:
                 self.close_position(current_price, "STOP_LOSS")
             elif current_price <= target:
                 self.close_position(current_price, "TAKE_PROFIT")
 
     def close_position(self, exit_price, reason):
-        """Close active position and record trade outcome"""
+        """Close active position and record trade with correct Deriv multiplier PnL."""
         pos = bot_state['position']
         if not pos:
             return
 
-        direction  = pos['direction']
-        entry      = pos['entry']
-        lots       = pos['size']
-        symbol     = pos['symbol']
-        pip_size   = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
-
+        direction = pos['direction']
+        entry     = pos['entry']
+        symbol    = pos['symbol']
+        pip_size  = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
         pips_earned = (exit_price - entry) / pip_size if direction == "LONG" else (entry - exit_price) / pip_size
 
-        specs = SYMBOL_SPECS.get(symbol, SYMBOL_SPECS["EURUSD"])
-        if specs.get("quote_is_usd", True):
-            pip_value_per_lot = specs["contract_size"] * pip_size
+        # Correct PnL: Deriv Multiplier contract formula
+        # pnl = stake * multiplier * (price_change / entry_price)
+        stake      = pos.get('stake_amount', pos.get('size', 1.0))
+        multiplier = pos.get('multiplier', 100)
+        if direction == "LONG":
+            pnl = stake * multiplier * (exit_price - entry) / entry
         else:
-            pip_value_per_lot = (specs["contract_size"] * pip_size) / exit_price
-        pnl = pips_earned * pip_value_per_lot * lots
+            pnl = stake * multiplier * (entry - exit_price) / entry
 
         bot_state['total_trades']  += 1
         bot_state['session_pnl']   += pnl
@@ -984,51 +1101,71 @@ class DerivForexBot:
                     size, pnl, result, ta_signal_strength, spread_pips, volatility, atr_15m, news_score, sr_scenario, session_window
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                symbol,
-                pos['timestamp'],
-                datetime.now(timezone.utc).isoformat(),
-                direction, entry, exit_price, lots, pnl, reason,
-                float(pos.get('strength', 0.0)),
-                float(pos.get('spread_pips', 0.0)),
-                float(pos.get('volatility', 0.0)),
-                float(pos.get('atr_15m', 0.0)),
-                float(pos.get('news_score', 0.0)),
-                str(pos.get('sr_scenario', 'UNKNOWN')),
+                symbol, pos['timestamp'], datetime.now(timezone.utc).isoformat(),
+                direction, entry, exit_price, stake, pnl, reason,
+                float(pos.get('strength', 0.0)), float(pos.get('spread_pips', 0.0)),
+                float(pos.get('volatility', 0.0)), float(pos.get('atr_15m', 0.0)),
+                float(pos.get('news_score', 0.0)), str(pos.get('sr_scenario', 'UNKNOWN')),
                 'LIVE' if self.connected and not self.dry_run else 'DRY_RUN'
             ))
             self.conn.commit()
         except Exception as e:
-            print(f"⚠️ Error logging trade outcome to SQLite: {e}")
+            print(f"⚠️ Error logging trade to SQLite: {e}")
 
         print(f" 🏁 POSITION CLOSED [{symbol}] — Reason: {reason} | Exit: {exit_price:.5f} | PnL: ${pnl:.2f} ({pips_earned:.1f} pips)")
         win_rate = (bot_state['winning_trades'] / bot_state['total_trades'] * 100) if bot_state['total_trades'] > 0 else 0.0
         print(f" 📊 Session Stats — Trades: {bot_state['total_trades']} | Win Rate: {win_rate:.0f}% | Session PnL: ${bot_state['session_pnl']:.2f} | Consec. Losses: {bot_state['consecutive_losses']}")
         self.clear_position_state()
-
-        # ── BUG FIX: Refresh balance from Deriv after every closed trade ──
-        self.initialize_balance()
+        self.initialize_balance()  # Refresh real balance after trade
 
         max_daily_loss = bot_state['session_start_balance'] * MAX_DAILY_LOSS_PCT
         if bot_state['session_pnl'] < -max_daily_loss:
-            print(f"🛑 DAILY LOSS LIMIT HIT: Session PnL ${bot_state['session_pnl']:.2f} exceeded -{max_daily_loss:.2f} ({MAX_DAILY_LOSS_PCT*100:.0f}% of start balance). Bot halted for today.")
-            sys.exit(0)
+            print(f"🛑 DAILY LOSS LIMIT HIT: Session PnL ${bot_state['session_pnl']:.2f} exceeded −${max_daily_loss:.2f}. Bot halted.")
+            self._halt_bot("DAILY_LOSS_LIMIT")
+            return
 
         if bot_state['consecutive_losses'] >= bot_state['max_consecutive_losses']:
-            print(f"🛑 CIRCUIT BREAKER: {bot_state['consecutive_losses']} consecutive losses hit the limit of {bot_state['max_consecutive_losses']}. Bot halted.")
-            sys.exit(0)
+            print(f"🛑 CIRCUIT BREAKER: {bot_state['consecutive_losses']} consecutive losses. Bot halted.")
+            self._halt_bot("CIRCUIT_BREAKER")
 
     def run_cycle(self):
-        """Single polling cycle across supported Forex symbols"""
+        """Single polling cycle across supported Forex symbols."""
+        # ── 1. Ensure WebSocket is alive before doing anything ─────────────
+        self._ensure_connected()
+
+        # ── 2. Daily stats reset at UTC midnight ───────────────────────────
+        today = datetime.now(timezone.utc).date()
+        if today != bot_state.get('last_reset_date'):
+            print(f"🌅 New trading day ({today}). Resetting session stats.")
+            bot_state['session_pnl']          = 0.0
+            bot_state['daily_trades']          = 0
+            bot_state['session_start_balance'] = bot_state['available_balance']
+            bot_state['last_reset_date']       = today
+
         print(f"\n🔄 --- Running Deriv Forex Cycle [{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] ---")
 
         if bot_state['position']:
-            pos = bot_state['position']
+            pos    = bot_state['position']
             symbol = pos['symbol']
 
+            # ── 3. Verify contract is still open server-side ───────────────
+            contract_id = str(pos.get('order_id', ''))
+            if not self._is_contract_open(contract_id):
+                print(f" ⚠️ Contract {contract_id} was already closed by Deriv. Syncing local state.")
+                # Record it as a server-side close (we don't know the exact exit)
+                tick_res = self._send_request({"ticks_history": DERIV_SYMBOLS.get(symbol, symbol), "count": 1, "end": "latest", "style": "ticks"})
+                last_price = pos['entry']
+                if tick_res and "history" in tick_res:
+                    prices = tick_res["history"].get("prices", [])
+                    if prices:
+                        last_price = float(prices[-1])
+                self.close_position(last_price, "SERVER_CLOSED")
+                return
+
+            # ── 4. Fetch live price (never fall back to simulated data) ────
             cur_price = None
             if self.connected:
                 deriv_sym = DERIV_SYMBOLS.get(symbol, symbol)
-                # BUG FIX: Use ticks_history (not subscription-based ticks) for OTP WebSocket
                 tick_res = self._send_request({
                     "ticks_history": deriv_sym,
                     "count": 1,
@@ -1040,15 +1177,11 @@ class DerivForexBot:
                     if prices:
                         cur_price = float(prices[-1])
 
-            if cur_price is None:
-                data = self.fetch_multi_timeframe_data(symbol)
-                cur_price = float(data['15m']['close'][-1]) if data else None
-
             if cur_price is not None:
                 print(f" 📊 Open Position Active: {pos['direction']} {symbol} | Live Price: {cur_price:.5f}")
                 self.manage_position(cur_price)
             else:
-                print(f" ⚠️ Could not fetch price for open position on {symbol}")
+                print(f" ⚠️ Could not fetch live price for open position on {symbol}. Skipping management this cycle.")
             return
 
         for symbol in TRADE_SYMBOLS:
@@ -1059,7 +1192,7 @@ class DerivForexBot:
 
             data = self.fetch_multi_timeframe_data(symbol)
             if not data:
-                print(f" ⚠️ Could not fetch market data for {symbol}")
+                print(f" ⚠️ Could not fetch market data for {symbol}. Skipping.")
                 continue
 
             indicators, current_price, volatility = self.calculate_indicators(data)
@@ -1092,6 +1225,9 @@ def main():
         try:
             while True:
                 bot.run_cycle()
+                if bot_state.get('halt'):
+                    print(f"🛑 Bot halted: {bot_state.get('halt_reason', 'unknown')}. Exiting.")
+                    break
                 time.sleep(15)
         except KeyboardInterrupt:
             print("\n🛑 Deriv Forex Bot stopped by user.")
@@ -1099,3 +1235,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
