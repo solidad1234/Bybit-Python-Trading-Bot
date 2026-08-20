@@ -84,17 +84,19 @@ def get_sentiment_score() -> dict:
 # ---------------------------------------------------------------------------
 
 def _fng_to_score(value: int) -> float:
-    """Map F&G index (0-100) to contrarian score (-1.0 to +1.0)."""
-    if value <= 20:
-        return 0.8 + (20 - value) / 100       # 0.80 … 1.00
-    elif value <= 40:
-        return 0.2 + (40 - value) / 50        # 0.20 … 0.60
-    elif value <= 60:
-        return 0.0
-    elif value <= 80:
-        return -0.2 - (value - 60) / 50       # -0.20 … -0.60
+    """Map F&G index (0-100) to contrarian score (-1.0 to +1.0).
+    Normal bull market sentiment (35-70) is neutral (0.0).
+    Extreme Fear (<30) = LONG opportunity (+0.30 … +1.00).
+    Extreme Greed (>75) = SHORT warning (-0.30 … -1.00).
+    """
+    if value <= 30:
+        return 0.3 + (30 - value) / 42.85     # 0.30 … 1.00 at 0
+    elif value <= 70:
+        return 0.0                            # 35-70 = normal trending sentiment (neutral)
+    elif value <= 75:
+        return -0.2                           # 71-75 = mild warning
     else:
-        return -0.8 - (value - 80) / 100      # -0.80 … -1.00
+        return -0.3 - (value - 75) / 35.71     # -0.30 … -1.00 at 100
 
 
 def _neutral(reason=""):

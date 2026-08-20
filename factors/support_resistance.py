@@ -289,9 +289,10 @@ def _classify_scenario(price, nearest_sup, nearest_res, atr, volume_ratio):
 
     # ── At a level ────────────────────────────────────────────────────────────
     if res_p and abs(price - res_p) <= AT_LEVEL_ATR_MULT * atr:
-        # Stronger level = higher score magnitude
-        str_bonus = min(0.20, nearest_res.get("strength", 1) * 0.03)
-        return "AT_RESISTANCE", -(0.55 + str_bonus)
+        if volume_ratio >= 1.2:
+            return "AT_RESISTANCE", 0.0      # ⚡ Volume expanding at resistance = potential breakout test
+        str_bonus = min(0.15, nearest_res.get("strength", 1) * 0.02)
+        return "AT_RESISTANCE", -(0.20 + str_bonus)
 
     if sup_p and abs(price - sup_p) <= AT_LEVEL_ATR_MULT * atr:
         str_bonus = min(0.20, nearest_sup.get("strength", 1) * 0.03)

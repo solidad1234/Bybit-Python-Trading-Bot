@@ -117,6 +117,20 @@ class FuturesTradingBot:
                 lowest_price REAL
             )
         ''')
+        # ── Auto-migrate: add columns that may be missing in older DB files ──
+        existing_cols = {row[1] for row in self.cursor.execute('PRAGMA table_info(position)').fetchall()}
+        migrations = [
+            ("symbol",         "TEXT"),
+            ("original_stop",  "REAL"),
+            ("highest_price",  "REAL"),
+            ("lowest_price",   "REAL"),
+        ]
+        for col, col_type in migrations:
+            if col not in existing_cols:
+                self.cursor.execute(f'ALTER TABLE position ADD COLUMN {col} {col_type}')
+                print(f"🔧 DB migration: added column '{col}' to position table")
+        self.conn.commit()
+        # ─────────────────────────────────────────────────────────────────────
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS ai_training_data (
                 id INTEGER PRIMARY KEY,
@@ -330,6 +344,16 @@ class FuturesTradingBot:
         pos_copy = pos.copy()
         if 'timestamp' in pos_copy and isinstance(pos_copy['timestamp'], datetime):
             pos_copy['timestamp'] = pos_copy['timestamp'].isoformat()
+        # Convert numpy/pandas int64 and float64 to native Python types
+        # (prevents "Object of type int64 is not JSON serializable" errors)
+        for key, val in pos_copy.items():
+            if hasattr(val, 'item'):          # catches numpy scalars (int64, float64, etc.)
+                pos_copy[key] = val.item()
+            elif isinstance(val, dict):       # factor_context dict may also contain numpy types
+                pos_copy[key] = {
+                    k: v.item() if hasattr(v, 'item') else v
+                    for k, v in val.items()
+                }
         return pos_copy
 
     def deserialize_position(self, pos):
