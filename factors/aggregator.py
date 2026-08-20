@@ -246,7 +246,7 @@ class MultiFactorAggregator:
         strength  = ta_signal.get("strength", 0)
 
         if direction == "LONG":
-            score = min(1.0, (strength - 4) / 3.0)   # 5=0.33, 6=0.67, 7=1.0
+            score = min(1.0, (strength - 3) / 4.0)   # 4=0.25, 5=0.50, 6=0.75, 7=1.0
         elif direction == "SHORT":
             score = -min(1.0, (strength - 5) / 5.0)  # 6=-0.2, 8=-0.6, 10=-1.0
         else:
