@@ -68,28 +68,69 @@ MAX_DAILY_LOSS_PCT       = 0.05
 
 # ── WebSocket helpers ─────────────────────────────────────────────────────
 
+DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
 def get_ws():
-    if not HAS_WS or not DERIV_API_TOKEN or not HAS_REQUESTS:
+    """Connect to Deriv WebSocket.
+    PAT tokens (pat_... or long tokens) use REST OTP auth.
+    Short API tokens use legacy direct WS auth.
+    """
+    if not HAS_WS or not DERIV_API_TOKEN:
         return None
-    try:
-        hdrs = {"Authorization": f"Bearer {DERIV_API_TOKEN}",
-                "Deriv-App-ID": DERIV_APP_ID, "Content-Type": "application/json"}
-        res = requests.get("https://api.derivws.com/trading/v1/options/accounts", headers=hdrs, timeout=10)
-        if res.status_code != 200:
-            print(f"❌ Auth failed: {res.text}"); return None
-        accounts = res.json().get("data", [])
-        acc_id = accounts[0]["account_id"] if accounts else None
-        if not acc_id:
-            print("❌ No account found"); return None
-        otp = requests.post(f"https://api.derivws.com/trading/v1/options/accounts/{acc_id}/otp", headers=hdrs, timeout=10)
-        ws_url = otp.json().get("data", {}).get("url")
-        if not ws_url:
-            print(f"❌ OTP failed"); return None
-        ws = websocket.create_connection(ws_url, timeout=15)
-        print(f"✅ Connected to Deriv (Account: {acc_id})")
-        return ws
-    except Exception as e:
-        print(f"❌ WS error: {e}"); return None
+
+    is_pat = DERIV_API_TOKEN.startswith("pat_") or len(DERIV_API_TOKEN) > 40
+
+    # ── Method 1: REST OTP auth for PAT tokens ────────────────────────────
+    if is_pat and HAS_REQUESTS:
+        try:
+            hdrs = {
+                "Authorization": f"Bearer {DERIV_API_TOKEN}",
+                "Deriv-App-ID": DERIV_APP_ID,
+                "Content-Type": "application/json"
+            }
+            res = requests.get("https://api.derivws.com/trading/v1/options/accounts", headers=hdrs, timeout=10)
+            if res.status_code != 200:
+                print(f"❌ OTP list failed ({res.status_code}): {res.text}")
+            else:
+                accounts = res.json().get("data", [])
+                acc = next((a for a in accounts if a.get("account_type") == "real"), None) or (accounts[0] if accounts else None)
+                if not acc:
+                    print("❌ No Deriv account found")
+                else:
+                    acc_id = acc["account_id"]
+                    otp_res = requests.post(
+                        f"https://api.derivws.com/trading/v1/options/accounts/{acc_id}/otp",
+                        headers=hdrs, timeout=10)
+                    ws_url = otp_res.json().get("data", {}).get("url") if otp_res.ok else None
+                    if ws_url:
+                        ws = websocket.create_connection(ws_url, timeout=15)
+                        print(f"✅ Connected via OTP | Account: {acc_id} | Balance: {acc.get('balance')} {acc.get('currency', 'USD')}")
+                        return ws
+                    else:
+                        print(f"❌ OTP URL not returned: {otp_res.text[:200]}")
+        except Exception as e:
+            print(f"❌ OTP auth error: {e}")
+
+    # ── Method 2: Legacy direct WS auth (for short non-PAT tokens) ───────
+    if not is_pat:
+        try:
+            ws = websocket.create_connection(DERIV_WS_URL, timeout=15)
+            ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+            ws.settimeout(15)
+            res = json.loads(ws.recv())
+            if res and "authorize" in res:
+                acc = res["authorize"]
+                print(f"✅ Connected | Account: {acc.get('loginid')} | Balance: {acc.get('balance')} {acc.get('currency')}")
+                return ws
+            else:
+                err = res.get("error", {}).get("message", "Auth failed") if res else "No response"
+                print(f"❌ Legacy WS auth failed: {err}")
+                ws.close()
+        except Exception as e:
+            print(f"❌ WS connection error: {e}")
+
+    return None
+
 
 
 def ws_req(ws, payload, timeout=15):
@@ -162,12 +203,15 @@ def get_signal(i15, i1h, i4h, price, vol):
 
 
 # ── PnL calculation ───────────────────────────────────────────────────────
+# Deriv Multiplier contract: pnl = stake * multiplier * (Δprice / entry)
+# This is NOT the same as standard Forex lot math (pips * pip_value * lots).
+# The backtest uses stake = balance * risk_per_trade, multiplier = 100.
 
-def calc_pnl(symbol, direction, entry, exit_p, lots):
-    s = SYMBOL_SPECS[symbol]; pip = s["pip_size"]
-    pips = (exit_p-entry)/pip if direction=="LONG" else (entry-exit_p)/pip
-    pvl  = s["contract_size"]*pip if s["quote_is_usd"] else (s["contract_size"]*pip)/exit_p
-    return pips * pvl * lots
+def calc_pnl(symbol, direction, entry, exit_p, stake, multiplier=100):
+    if direction == "LONG":
+        return stake * multiplier * (exit_p - entry) / entry
+    else:
+        return stake * multiplier * (entry - exit_p) / entry
 
 
 # ── Core backtester ───────────────────────────────────────────────────────
@@ -196,41 +240,60 @@ def backtest_symbol(ws_unused, symbol, df15, df1h, df4h, start_balance):
         if pos:
             hi, lo = float(bar["high"]), float(bar["low"])
             entry  = pos["entry"]; orig = pos["orig_stop"]
+            stake  = pos["stake"]; atr  = pos["atr"]
 
             if pos["dir"] == "LONG":
-                if not pos["be"] and (hi-entry)/pip >= (entry-orig)/pip:
-                    pos["stop"] = entry + 2*pip; pos["be"] = True
+                pos["highest"] = max(pos["highest"], hi)
+                # Break-even at 1:1 R:R
+                if not pos["be"] and (hi - entry) / pip >= (entry - orig) / pip:
+                    pos["stop"] = entry + 2 * pip; pos["be"] = True
+                # ATR trailing stop (mirrors live bot)
+                if pos["be"]:
+                    trail = pos["highest"] - 1.5 * atr
+                    if trail > pos["stop"]:
+                        pos["stop"] = trail
                 if lo <= pos["stop"]:
-                    ep = pos["stop"]; pnl = calc_pnl(symbol, "LONG", entry, ep, pos["lots"])
+                    ep  = pos["stop"]
+                    pnl = calc_pnl(symbol, "LONG", entry, ep, stake)
                     balance += pnl; daily_pnl += pnl
-                    trades.append({"symbol":symbol,"direction":"LONG","entry":entry,"exit":ep,
-                                   "pnl":round(pnl,4),"result":"WIN" if pnl>0 else "LOSS",
-                                   "pips":round((ep-entry)/pip,1),"date":dt.strftime("%Y-%m-%d %H:%M")})
+                    trades.append({"symbol": symbol, "direction": "LONG", "entry": entry, "exit": ep,
+                                   "pnl": round(pnl, 4), "result": "WIN" if pnl > 0 else "LOSS",
+                                   "pips": round((ep - entry) / pip, 1), "date": dt.strftime("%Y-%m-%d %H:%M")})
                     pos = None; continue
                 if hi >= pos["target"]:
-                    ep = pos["target"]; pnl = calc_pnl(symbol, "LONG", entry, ep, pos["lots"])
+                    ep  = pos["target"]
+                    pnl = calc_pnl(symbol, "LONG", entry, ep, stake)
                     balance += pnl; daily_pnl += pnl
-                    trades.append({"symbol":symbol,"direction":"LONG","entry":entry,"exit":ep,
-                                   "pnl":round(pnl,4),"result":"WIN" if pnl>0 else "LOSS",
-                                   "pips":round((ep-entry)/pip,1),"date":dt.strftime("%Y-%m-%d %H:%M")})
+                    trades.append({"symbol": symbol, "direction": "LONG", "entry": entry, "exit": ep,
+                                   "pnl": round(pnl, 4), "result": "WIN" if pnl > 0 else "LOSS",
+                                   "pips": round((ep - entry) / pip, 1), "date": dt.strftime("%Y-%m-%d %H:%M")})
                     pos = None; continue
 
             elif pos["dir"] == "SHORT":
-                if not pos["be"] and (entry-lo)/pip >= (orig-entry)/pip:
-                    pos["stop"] = entry - 2*pip; pos["be"] = True
+                pos["lowest"] = min(pos["lowest"], lo)
+                # Break-even at 1:1 R:R
+                if not pos["be"] and (entry - lo) / pip >= (orig - entry) / pip:
+                    pos["stop"] = entry - 2 * pip; pos["be"] = True
+                # ATR trailing stop
+                if pos["be"]:
+                    trail = pos["lowest"] + 1.5 * atr
+                    if trail < pos["stop"]:
+                        pos["stop"] = trail
                 if hi >= pos["stop"]:
-                    ep = pos["stop"]; pnl = calc_pnl(symbol, "SHORT", entry, ep, pos["lots"])
+                    ep  = pos["stop"]
+                    pnl = calc_pnl(symbol, "SHORT", entry, ep, stake)
                     balance += pnl; daily_pnl += pnl
-                    trades.append({"symbol":symbol,"direction":"SHORT","entry":entry,"exit":ep,
-                                   "pnl":round(pnl,4),"result":"WIN" if pnl>0 else "LOSS",
-                                   "pips":round((entry-ep)/pip,1),"date":dt.strftime("%Y-%m-%d %H:%M")})
+                    trades.append({"symbol": symbol, "direction": "SHORT", "entry": entry, "exit": ep,
+                                   "pnl": round(pnl, 4), "result": "WIN" if pnl > 0 else "LOSS",
+                                   "pips": round((entry - ep) / pip, 1), "date": dt.strftime("%Y-%m-%d %H:%M")})
                     pos = None; continue
                 if lo <= pos["target"]:
-                    ep = pos["target"]; pnl = calc_pnl(symbol, "SHORT", entry, ep, pos["lots"])
+                    ep  = pos["target"]
+                    pnl = calc_pnl(symbol, "SHORT", entry, ep, stake)
                     balance += pnl; daily_pnl += pnl
-                    trades.append({"symbol":symbol,"direction":"SHORT","entry":entry,"exit":ep,
-                                   "pnl":round(pnl,4),"result":"WIN" if pnl>0 else "LOSS",
-                                   "pips":round((entry-ep)/pip,1),"date":dt.strftime("%Y-%m-%d %H:%M")})
+                    trades.append({"symbol": symbol, "direction": "SHORT", "entry": entry, "exit": ep,
+                                   "pnl": round(pnl, 4), "result": "WIN" if pnl > 0 else "LOSS",
+                                   "pips": round((entry - ep) / pip, 1), "date": dt.strftime("%Y-%m-%d %H:%M")})
                     pos = None; continue
             continue
 
@@ -264,18 +327,16 @@ def backtest_symbol(ws_unused, symbol, df15, df1h, df4h, start_balance):
         sig, score, atr = get_signal(i15, i1h, i4h, price, vol)
         if not sig: continue
 
-        # ── Sizing ────────────────────────────────────────────────────────
-        stop_pips   = max(15.0, 1.5*atr/pip)
+        # ── Sizing (Deriv Multiplier: stake = balance * risk%) ────────────
+        stop_pips   = max(15.0, 1.5 * atr / pip)
         reward_pips = stop_pips * min_reward_ratio
-        if specs["quote_is_usd"]:
-            pvl = specs["contract_size"] * pip
-        else:
-            pvl = (specs["contract_size"] * pip) / price
-        lots = max(0.01, round(round((balance*forex_risk_per_trade)/(stop_pips*pvl)/0.01)*0.01, 2))
-        sl = price-(stop_pips*pip) if sig=="LONG" else price+(stop_pips*pip)
-        tp = price+(reward_pips*pip) if sig=="LONG" else price-(reward_pips*pip)
+        stake = max(1.0, round(balance * forex_risk_per_trade, 2))
+        sl = price - (stop_pips * pip) if sig == "LONG" else price + (stop_pips * pip)
+        tp = price + (reward_pips * pip) if sig == "LONG" else price - (reward_pips * pip)
 
-        pos = {"dir":sig,"entry":price,"stop":sl,"target":tp,"orig_stop":sl,"be":False,"lots":lots}
+        pos = {"dir": sig, "entry": price, "stop": sl, "target": tp, "orig_stop": sl,
+               "be": False, "stake": stake, "atr": atr,
+               "highest": price, "lowest": price}
 
     return trades, balance
 

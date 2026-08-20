@@ -1330,6 +1330,7 @@ class FuturesTradingBot:
                 continue
 
             indicators, current_price, volatility = self.calculate_indicators(data)
+            print(f"   💲 Price: ${current_price:,.4f}")
 
             # Regime Filter: Block if flat
             if indicators['1h']['adx'] < 18:
