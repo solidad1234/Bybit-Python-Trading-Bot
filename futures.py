@@ -52,7 +52,7 @@ min_volatility_threshold = 0.02
 # Trading Limits
 max_daily_trades = 15
 min_trade_gap_hours = 2
-signal_strength_threshold = 5
+signal_strength_threshold = 4
 
 # Initialize Bybit session
 session = HTTP(
@@ -653,8 +653,8 @@ class FuturesTradingBot:
         long_score  = sum(futures_long_conditions)
         short_score = sum(futures_short_conditions)
 
-        # Dynamic LONG threshold: require more evidence during bearish macro regime
-        min_long_score = 6 if regime_score <= -0.4 else 5
+        # Dynamic LONG threshold: require 4+ conditions (5 during bearish macro regime)
+        min_long_score = 5 if regime_score <= -0.4 else 4
 
         # Log 4h trend context
         trend_label = "BULL" if trend_bullish else ("BEAR" if trend_bearish else "FLAT")
