@@ -90,12 +90,15 @@ def _funding(symbol: str):
             avg_rate = float(np.mean(rates)) if rates else current_rate
 
         # Map to score — contrarian interpretation
-        # Typical neutral range: ±0.01% per 8h (0.0001)
-        # Extreme thresholds:  +0.05% (0.0005) and -0.03% (-0.0003)
-        if avg_rate >= 0:
-            score = -min(1.0, avg_rate / 0.0005)   # 0.05%/8h = max negative
+        # Standard neutral range: 0.0% to +0.015% per 8h (0.00015) — normal bull market baseline
+        # High positive funding: > 0.015%/8h → longs overcrowded → negative score
+        # Negative funding: < 0.0% → shorts overcrowded → positive score
+        if avg_rate > 0.00015:
+            score = -min(1.0, (avg_rate - 0.00015) / 0.0004)   # >0.055%/8h = max negative (-1.0)
+        elif avg_rate < 0:
+            score = min(1.0, abs(avg_rate) / 0.0003)            # -0.03%/8h = max positive (+1.0)
         else:
-            score = min(1.0, abs(avg_rate) / 0.0003)  # -0.03%/8h = max positive
+            score = 0.0                                         # 0 to 0.015% = neutral baseline
 
         return {
             "score":              round(score, 3),
