@@ -206,6 +206,36 @@ class FuturesTradingBot:
         ''')
         self.conn.commit()
 
+        # ── Auto-migrate trade_log table for existing databases ──
+        existing_log_cols = {row[1] for row in self.cursor.execute('PRAGMA table_info(trade_log)').fetchall()}
+        log_migrations = [
+            ("ta_signal_strength", "REAL"),
+            ("aggregated_score",   "REAL"),
+            ("volatility",         "REAL"),
+            ("atr_15m",            "REAL"),
+            ("technical_score",    "REAL"),
+            ("regime_score",       "REAL"),
+            ("derivatives_score",  "REAL"),
+            ("sentiment_score",    "REAL"),
+            ("news_score",         "REAL"),
+            ("sr_score",           "REAL"),
+            ("sr_scenario",        "TEXT"),
+            ("regime_class",       "TEXT"),
+            ("funding_rate",       "REAL"),
+            ("open_interest",      "REAL"),
+            ("long_short_ratio",   "REAL"),
+            ("news_sentiment",     "TEXT"),
+            ("market_trend_4h",    "TEXT"),
+        ]
+        for col, col_type in log_migrations:
+            if col not in existing_log_cols:
+                try:
+                    self.cursor.execute(f'ALTER TABLE trade_log ADD COLUMN {col} {col_type}')
+                    print(f"🔧 DB migration: added column '{col}' to trade_log table")
+                except Exception as mig_err:
+                    pass
+        self.conn.commit()
+
     def save_position_state(self):
         """Save current position state to SQLite"""
         if not futures_state['position']:
