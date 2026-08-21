@@ -41,7 +41,7 @@ HIGHER_TF = "60"
 
 FUTURES_RISK_PER_TRADE = 0.02
 MIN_REWARD_RATIO = 2.0       # 2:1 R:R target
-SIGNAL_STRENGTH_THRESHOLD = 5
+SIGNAL_STRENGTH_THRESHOLD = 4
 MAX_DAILY_TRADES = 15
 MAX_CONSECUTIVE_LOSSES = 3
 
@@ -60,8 +60,8 @@ CONTRACT_SPECS = {
 MF_WEIGHTS          = {"regime": 0.25, "derivatives": 0.22,
                        "technical": 0.20, "support_resistance": 0.15,
                        "sentiment": 0.12, "news": 0.06}
-MF_LONG_THRESHOLD   = 0.10   # threshold for dataset generation
-MF_SHORT_THRESHOLD  = 0.10   # threshold for dataset generation
+MF_LONG_THRESHOLD   = 0.25   # production threshold
+MF_SHORT_THRESHOLD  = 0.15   # production threshold
 
 
 # ----------------------------------------------------------------------
@@ -224,16 +224,14 @@ def build_regime_scores(btc1h: pd.DataFrame) -> dict:
 
 def _fng_to_score(value: int) -> float:
     """Contrarian mapping of F&G value (0-100) -> score (-1 to +1)."""
-    if value <= 20:
-        return 0.8 + (20 - value) / 100
-    elif value <= 40:
-        return 0.2 + (40 - value) / 50
-    elif value <= 60:
+    if value <= 30:
+        return 0.3 + (30 - value) / 42.85
+    elif value <= 70:
         return 0.0
-    elif value <= 80:
-        return -0.2 - (value - 60) / 50
+    elif value <= 75:
+        return -0.2
     else:
-        return -0.8 - (value - 80) / 100
+        return -0.3 - (value - 75) / 35.71
 
 
 def compute_multi_factor_details(
@@ -252,7 +250,7 @@ def compute_multi_factor_details(
     direction = ta_signal.get("signal")
     strength  = ta_signal.get("strength", 0)
     if direction == "LONG":
-        ta_score = min(1.0, (strength - 4) / 3.0)
+        ta_score = min(1.0, (strength - 3) / 4.0)
     elif direction == "SHORT":
         ta_score = -min(1.0, (strength - 5) / 5.0)
     else:
@@ -269,10 +267,12 @@ def compute_multi_factor_details(
         past = [ts for ts in funding_map if ts <= bar_ms]
         if past:
             funding_rate = funding_map[max(past)]
-            if funding_rate >= 0:
-                deriv_score = -min(1.0, funding_rate / 0.0005)
-            else:
+            if funding_rate > 0.00015:
+                deriv_score = -min(1.0, (funding_rate - 0.00015) / 0.0004)
+            elif funding_rate < 0:
                 deriv_score = min(1.0, abs(funding_rate) / 0.0003)
+            else:
+                deriv_score = 0.0
 
     # 4. Sentiment
     sentiment_score = 0.0
@@ -341,7 +341,7 @@ def calculate_signal(row15, row1h, row4h, volatility, regime_score=0.0):
     long_score  = sum(bool(c) for c in long_conditions)
     short_score = sum(bool(c) for c in short_conditions)
 
-    min_long_score = 6 if regime_score <= -0.4 else 5
+    min_long_score = 5 if regime_score <= -0.4 else 4
 
     if long_score >= min_long_score and trend_bullish:
         return {"signal": "LONG",  "strength": long_score,  "leverage": 10.0}

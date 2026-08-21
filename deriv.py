@@ -253,7 +253,9 @@ class DerivForexBot:
         return None
 
     def _ensure_connected(self):
-        """Verify WebSocket is alive; reconnect with legacy auth if dropped.
+        """Verify WebSocket is alive; reconnect using the same auth method used at startup.
+        - PAT tokens (pat_... or len>40): requests a fresh OTP URL via REST and connects to it.
+        - Legacy tokens: reconnects via legacy WS authorize message.
         Called at the top of every run_cycle() to guarantee live data.
         """
         if not HAS_WEBSOCKET or self.dry_run or not DERIV_API_TOKEN:
@@ -271,17 +273,67 @@ class DerivForexBot:
             self.connected = False
 
         print("\u26a0\ufe0f WebSocket disconnected. Attempting reconnection...")
+        is_pat = DERIV_API_TOKEN.startswith("pat_") or len(DERIV_API_TOKEN) > 40
+
         for attempt in range(1, 4):
             try:
-                self.ws = websocket.create_connection(DERIV_WS_URL, timeout=10.0)
-                auth_res = self._send_request({"authorize": DERIV_API_TOKEN})
-                if auth_res and "authorize" in auth_res:
+                if is_pat:
+                    # ── PAT: request a fresh OTP URL from the REST API ──────
+                    import requests
+                    headers = {
+                        "Authorization": f"Bearer {DERIV_API_TOKEN}",
+                        "Deriv-App-ID": DERIV_APP_ID,
+                        "Content-Type": "application/json"
+                    }
+                    acc_res = requests.get(
+                        "https://api.derivws.com/trading/v1/options/accounts",
+                        headers=headers, timeout=10
+                    )
+                    if acc_res.status_code != 200:
+                        raise Exception(f"Accounts fetch failed: HTTP {acc_res.status_code}")
+
+                    accounts_data = acc_res.json().get("data", [])
+                    selected_acc = None
+                    target_type = "demo" if self.dry_run else "real"
+                    for acc in accounts_data:
+                        if acc.get("account_type") == target_type and acc.get("status") == "active":
+                            selected_acc = acc
+                            break
+                    if not selected_acc and accounts_data:
+                        selected_acc = accounts_data[0]
+
+                    if not selected_acc:
+                        raise Exception("No active account found for PAT reconnect")
+
+                    acc_id = selected_acc.get("account_id")
+                    otp_res = requests.post(
+                        f"https://api.derivws.com/trading/v1/options/accounts/{acc_id}/otp",
+                        headers=headers, timeout=10
+                    )
+                    if otp_res.status_code not in [200, 201]:
+                        raise Exception(f"OTP request failed: HTTP {otp_res.status_code}")
+
+                    ws_url = otp_res.json().get("data", {}).get("url")
+                    if not ws_url:
+                        raise Exception("OTP response contained no WebSocket URL")
+
+                    self.ws = websocket.create_connection(ws_url, timeout=10.0)
                     self.connected = True
-                    print(f"\u2705 WebSocket reconnected successfully (attempt {attempt}).")
+                    print(f"\u2705 PAT WebSocket reconnected successfully (attempt {attempt}).")
                     return
+                else:
+                    # ── Legacy token: direct WS authorize ───────────────────
+                    self.ws = websocket.create_connection(DERIV_WS_URL, timeout=10.0)
+                    auth_res = self._send_request({"authorize": DERIV_API_TOKEN})
+                    if auth_res and "authorize" in auth_res:
+                        self.connected = True
+                        print(f"\u2705 WebSocket reconnected successfully (attempt {attempt}).")
+                        return
+                    raise Exception(auth_res.get("error", {}).get("message", "Auth failed") if auth_res else "No auth response")
             except Exception as e:
                 print(f"\u26a0\ufe0f Reconnect attempt {attempt}/3 failed: {e}")
-                time.sleep(2)
+                time.sleep(2 * attempt)  # Exponential-ish back-off
+
         print("\u274c Could not reconnect to Deriv WebSocket after 3 attempts. Data will not be live this cycle.")
         self.connected = False
 
