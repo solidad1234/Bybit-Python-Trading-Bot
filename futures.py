@@ -949,14 +949,18 @@ class FuturesTradingBot:
                 )
                 
                 if leverage_result.get("retCode") == 0:
-                    print(f"✅ Leverage set successfully")
+                    print(f"✅ Leverage set successfully to {signal['leverage']:.1f}x")
                 elif leverage_result.get("retCode") == 110043:
-                    print(f"ℹ️ Leverage already set (continuing)")
+                    print(f"ℹ️ Leverage already set to {signal['leverage']:.1f}x (continuing)")
                 else:
                     print(f"⚠️ Leverage response: {leverage_result.get('retMsg')} (continuing)")
                     
             except Exception as leverage_error:
-                print(f"⚠️ Leverage setting error: {leverage_error} (continuing)")
+                err_str = str(leverage_error)
+                if "110043" in err_str or "not modified" in err_str.lower():
+                    print(f"ℹ️ Leverage already set to {signal['leverage']:.1f}x (continuing)")
+                else:
+                    print(f"⚠️ Leverage setting error: {leverage_error} (continuing)")
             
             # Place the order — SL/TP included atomically to eliminate the race
             # window that exists when stops are set in a separate API call after fill.
