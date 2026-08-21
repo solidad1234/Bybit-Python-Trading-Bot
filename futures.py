@@ -1053,17 +1053,33 @@ class FuturesTradingBot:
         
         # Trailing stop
         new_stop = self.implement_trailing_stop(pos, current_price, indicators)
-        if new_stop and new_stop != pos['stop']:
-            pos['stop'] = new_stop
+        price_precision = 4 if current_price < 10 else 2
+        if new_stop is not None and round(new_stop, price_precision) != round(pos.get('stop', 0.0), price_precision):
+            target_stop_str = f"{new_stop:.{price_precision}f}"
             try:
-                session.set_trading_stop(
+                res = session.set_trading_stop(
                     category="linear",
                     symbol=pos['symbol'],
-                    stopLoss=str(round(new_stop, 2))
+                    stopLoss=target_stop_str
                 )
-                self.save_position_state()
+                if isinstance(res, dict) and res.get("retCode") == 0:
+                    pos['stop'] = new_stop
+                    self.save_position_state()
+                else:
+                    ret_code = res.get("retCode") if isinstance(res, dict) else None
+                    if ret_code == 34040:
+                        pos['stop'] = new_stop
+                        self.save_position_state()
+                    else:
+                        ret_msg = res.get("retMsg") if isinstance(res, dict) else str(res)
+                        print(f"⚠️ Could not set exchange trailing stop: {ret_msg}")
             except Exception as e:
-                print(f"⚠️ Error setting trailing stop: {e}")
+                err_str = str(e)
+                if "34040" in err_str or "not modified" in err_str.lower():
+                    pos['stop'] = new_stop
+                    self.save_position_state()
+                else:
+                    print(f"⚠️ Error setting trailing stop: {e}")
         
         # -- Early Scratch Exit --
         # If position goes adverse by -0.7% within first 45 minutes and stop hasn't
@@ -1117,12 +1133,13 @@ class FuturesTradingBot:
         entry_price = position['entry']
         current_stop = position['stop']
         atr_15m = indicators["15m"]["atr"]
+        price_precision = 4 if current_price < 10 else 2
 
         if direction == "SHORT":
             # Track the lowest price reached (best for SHORT)
             if 'lowest_price' not in position or current_price < position['lowest_price']:
                 position['lowest_price'] = current_price
-                print(f"📉 New best SHORT price: ${current_price:.2f}")
+                print(f"📉 New best SHORT price: ${current_price:.{price_precision}f}")
                 self.save_position_state()
 
             best_price = position['lowest_price']
@@ -1130,18 +1147,20 @@ class FuturesTradingBot:
 
             if unrealized_pnl_pct > 0.03:  # raised from 1.5% — avoids stop at breakeven converting winners
                 # Place stop just above best price with ATR buffer
-                proposed_stop = best_price + (1.5 * atr_15m)
+                raw_proposed = best_price + (1.5 * atr_15m)
+                proposed_stop = round(raw_proposed, price_precision)
+                rounded_current = round(current_stop, price_precision)
 
                 # Only update if better (lower than before)
-                if proposed_stop < current_stop:
-                    print(f"🔄 Trailing stop (SHORT): ${current_stop:.2f} → ${proposed_stop:.2f}")
+                if proposed_stop < rounded_current:
+                    print(f"🔄 Trailing stop (SHORT): ${rounded_current:.{price_precision}f} → ${proposed_stop:.{price_precision}f}")
                     return proposed_stop
 
         else:  # LONG
             # Track the highest price reached (best for LONG)
             if 'highest_price' not in position or current_price > position['highest_price']:
                 position['highest_price'] = current_price
-                print(f"📈 New best LONG price: ${current_price:.2f}")
+                print(f"📈 New best LONG price: ${current_price:.{price_precision}f}")
                 self.save_position_state()
 
             best_price = position['highest_price']
@@ -1149,11 +1168,13 @@ class FuturesTradingBot:
 
             if unrealized_pnl_pct > 0.03:  # raised from 1.5% — avoids stop at breakeven converting winners
                 # Place stop just below best price with ATR buffer
-                proposed_stop = best_price - (1.5 * atr_15m)
+                raw_proposed = best_price - (1.5 * atr_15m)
+                proposed_stop = round(raw_proposed, price_precision)
+                rounded_current = round(current_stop, price_precision)
 
                 # Only update if better (higher than before)
-                if proposed_stop > current_stop:
-                    print(f"🔄 Trailing stop (LONG): ${current_stop:.2f} → ${proposed_stop:.2f}")
+                if proposed_stop > rounded_current:
+                    print(f"🔄 Trailing stop (LONG): ${rounded_current:.{price_precision}f} → ${proposed_stop:.{price_precision}f}")
                     return proposed_stop
 
         # No change
