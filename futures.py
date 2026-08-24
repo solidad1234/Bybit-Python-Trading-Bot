@@ -84,6 +84,7 @@ class FuturesTradingBot:
         print(f"🚀 Initializing Futures Trading Bot...")
         self.init_db()
         self.load_position_state()
+        self.load_bot_state()       # restores last_trade_time across restarts
         self.initialize_balance()
         self.state_file = 'trading_state.json'
 
@@ -235,6 +236,47 @@ class FuturesTradingBot:
                 except Exception as mig_err:
                     pass
         self.conn.commit()
+
+        # ── bot_state: persists last_trade_time across restarts ──────────────
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        self.conn.commit()
+
+    def save_bot_state(self):
+        """Persist last_trade_time to SQLite so the 2h gap survives restarts."""
+        ltt = futures_state.get('last_trade_time')
+        value = ltt.isoformat() if isinstance(ltt, datetime) else ''
+        try:
+            self.cursor.execute(
+                'INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)',
+                ('last_trade_time', value)
+            )
+            self.conn.commit()
+        except Exception as e:
+            print(f"⚠️ Could not persist bot_state: {e}")
+
+    def load_bot_state(self):
+        """Restore last_trade_time from SQLite on startup."""
+        try:
+            row = self.cursor.execute(
+                "SELECT value FROM bot_state WHERE key = 'last_trade_time'"
+            ).fetchone()
+            if row and row[0]:
+                ltt = datetime.fromisoformat(row[0])
+                futures_state['last_trade_time'] = ltt
+                hours_ago = (datetime.now() - ltt).total_seconds() / 3600
+                if hours_ago < min_trade_gap_hours:
+                    remaining = min_trade_gap_hours - hours_ago
+                    print(f"⏳ Trade gap restored from DB: last trade {hours_ago:.1f}h ago "
+                          f"({remaining:.1f}h remaining before next entry allowed)")
+                else:
+                    print(f"✅ Trade gap satisfied: last trade {hours_ago:.1f}h ago — ready to trade")
+        except Exception as e:
+            print(f"⚠️ Could not load bot_state: {e}")
 
     def save_position_state(self):
         """Save current position state to SQLite"""
@@ -1029,6 +1071,7 @@ class FuturesTradingBot:
                 futures_state['daily_trades'] += 1
                 futures_state['total_trades'] += 1
                 futures_state['last_trade_time'] = datetime.now()  # enforce min_trade_gap_hours
+                self.save_bot_state()   # persist gap so it survives restarts
                 self.save_state()
                 
                 return True
@@ -1309,36 +1352,41 @@ class FuturesTradingBot:
             self.save_position_state()
     
     def close_position(self, result_type, log_already_done=False, exit_price=None):
-        """Close futures position. Sends a reduceOnly market order as a safety net
-        (harmless if exchange SL/TP already closed it — Bybit will reject cleanly)."""
+        """Close futures position.
+        - If log_already_done=False (normal path): sends a reduceOnly safety-net order
+          in case exchange SL/TP hasn't fired yet.
+        - If log_already_done=True (called from sync_position_with_bybit): Bybit already
+          confirmed size=0, so skip the safety-net order to avoid error 110017.
+        """
         if not futures_state['position']:
             return
-        
+
         pos = futures_state['position']
-        ticker = SYMBOL_CONTRACT_SPECS.get(pos.get('symbol', ''), {}).get('ticker', pos.get('symbol', ''))
-        print(f"🚀 Closing futures {pos['direction']} position ({result_type})")
-        
-        # Safety-net close: reduceOnly so it fails gracefully if already closed by exchange SL/TP
-        remaining_size = pos.get('size', 0)
         sym = pos.get('symbol', '')
-        step = SYMBOL_CONTRACT_SPECS.get(sym, {}).get('step_size', 0.1)
-        min_closeable = step  # at least one step size to attempt
-        if remaining_size >= min_closeable:
-            closed = self._place_reduce_only_order(pos['direction'], remaining_size)
-            if closed:
-                qty_precision = 2 if step < 0.1 else 1
-                print(f"✅ Market close order sent for {remaining_size:.{qty_precision}f} {ticker}")
-            else:
-                print(f"ℹ️ Close order rejected — position likely already closed by exchange SL/TP")
-        
+        ticker = SYMBOL_CONTRACT_SPECS.get(sym, {}).get('ticker', sym)
+        print(f"🚀 Closing futures {pos['direction']} position ({result_type})")
+
         if not log_already_done:
+            # Safety-net close: reduceOnly so it fails gracefully if exchange already closed it
+            remaining_size = pos.get('size', 0)
+            step = SYMBOL_CONTRACT_SPECS.get(sym, {}).get('step_size', 0.1)
+            if remaining_size >= step:
+                closed = self._place_reduce_only_order(pos['direction'], remaining_size)
+                if closed:
+                    qty_precision = 2 if step < 0.1 else 1
+                    print(f"✅ Market close order sent for {remaining_size:.{qty_precision}f} {ticker}")
+                else:
+                    print(f"ℹ️ Close order rejected — position likely already closed by exchange SL/TP")
+
             fc = pos.get('factor_context', {})
             self.log_trade_outcome(
                 exit_price=exit_price,
                 result=result_type,
                 factor_context=fc,
             )
-        
+        else:
+            print(f"ℹ️ Exchange already closed position (confirmed via sync) — skipping safety-net order")
+
         # Update session P&L for circuit breaker
         if exit_price and pos.get('entry'):
             size = pos.get('size', 0)
@@ -1348,14 +1396,14 @@ class FuturesTradingBot:
                 trade_pnl = (pos['entry'] - exit_price) * size
             futures_state['session_pnl'] += trade_pnl
             print(f"📊 Session PnL updated: ${futures_state['session_pnl']:.2f}")
-        
+
         # Update statistics
         if result_type == "WIN":
             futures_state['winning_trades'] += 1
             futures_state['consecutive_losses'] = 0
         else:
             futures_state['consecutive_losses'] += 1
-        
+
         self.clear_position_state()
     
     def can_trade(self):
