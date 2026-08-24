@@ -575,6 +575,10 @@ class FuturesTradingBot:
     
     def calculate_indicators(self, data):
         """Calculate technical indicators using TA-Lib"""
+        if talib is None:
+            print("❌ TA-Lib is not installed. Cannot calculate indicators.")
+            return None, None, None
+
         indicators = {}
         
         for tf, prices in [("15m", data[primary_timeframe]), ("1h", data[higher_timeframe]), ("4h", data["240"])]:
@@ -1024,6 +1028,7 @@ class FuturesTradingBot:
                 
                 futures_state['daily_trades'] += 1
                 futures_state['total_trades'] += 1
+                futures_state['last_trade_time'] = datetime.now()  # enforce min_trade_gap_hours
                 self.save_state()
                 
                 return True
@@ -1221,12 +1226,16 @@ class FuturesTradingBot:
         (Bybit will reject cleanly with retCode != 0)."""
         try:
             close_side = "Sell" if direction == "LONG" else "Buy"
+            sym = futures_state['position']['symbol']
+            # Use symbol-aware step size for correct qty precision (e.g. ETH/BNB use 0.01)
+            step = SYMBOL_CONTRACT_SPECS.get(sym, {}).get("step_size", 0.1)
+            qty_precision = 2 if step < 0.1 else 1
             result = session.place_order(
                 category="linear",
-                symbol=futures_state['position']['symbol'],
+                symbol=sym,
                 side=close_side,
                 orderType="Market",
-                qty=str(round(qty, 1)),
+                qty=f"{qty:.{qty_precision}f}",
                 reduceOnly=True,
             )
             if result.get("retCode") == 0:
@@ -1306,14 +1315,19 @@ class FuturesTradingBot:
             return
         
         pos = futures_state['position']
+        ticker = SYMBOL_CONTRACT_SPECS.get(pos.get('symbol', ''), {}).get('ticker', pos.get('symbol', ''))
         print(f"🚀 Closing futures {pos['direction']} position ({result_type})")
         
         # Safety-net close: reduceOnly so it fails gracefully if already closed by exchange SL/TP
         remaining_size = pos.get('size', 0)
-        if remaining_size >= 0.1:
+        sym = pos.get('symbol', '')
+        step = SYMBOL_CONTRACT_SPECS.get(sym, {}).get('step_size', 0.1)
+        min_closeable = step  # at least one step size to attempt
+        if remaining_size >= min_closeable:
             closed = self._place_reduce_only_order(pos['direction'], remaining_size)
             if closed:
-                print(f"✅ Market close order sent for {remaining_size:.1f} SOL")
+                qty_precision = 2 if step < 0.1 else 1
+                print(f"✅ Market close order sent for {remaining_size:.{qty_precision}f} {ticker}")
             else:
                 print(f"ℹ️ Close order rejected — position likely already closed by exchange SL/TP")
         
@@ -1351,6 +1365,12 @@ class FuturesTradingBot:
         
         if futures_state['consecutive_losses'] >= futures_state['max_consecutive_losses']:
             return False, "Too many consecutive losses"
+        
+        # Enforce minimum gap between trades to prevent overtrading
+        if futures_state['last_trade_time'] is not None:
+            hours_since_last = (datetime.now() - futures_state['last_trade_time']).total_seconds() / 3600
+            if hours_since_last < min_trade_gap_hours:
+                return False, f"Trade gap not met ({hours_since_last:.1f}h < {min_trade_gap_hours}h required)"
         
         # Daily P&L circuit breaker: halt if session loss exceeds 5% of starting balance
         start_bal = futures_state.get('session_start_balance', 0)
@@ -1409,6 +1429,9 @@ class FuturesTradingBot:
                 continue
 
             indicators, current_price, volatility = self.calculate_indicators(data)
+            if indicators is None:
+                print(f"   ❌ Indicator calculation failed (TA-Lib unavailable?)")
+                continue
             print(f"   💲 Price: ${current_price:,.4f}")
 
             # Regime Filter: Block if flat
@@ -1549,6 +1572,8 @@ class FuturesTradingBot:
             data = self.fetch_multi_timeframe_data(futures_state['position']['symbol'])
             if data:
                 indicators_cache, _, _ = self.calculate_indicators(data)
+                if indicators_cache is None:
+                    print("⚠️ Could not build indicators cache for active position (TA-Lib unavailable?)")
         
         while True:
             try:
@@ -1573,6 +1598,7 @@ class FuturesTradingBot:
                     if today != last_reset_date:
                         futures_state['daily_trades'] = 0
                         futures_state['session_pnl'] = 0.0
+                        futures_state['consecutive_losses'] = 0  # fresh slate each day
                         futures_state['session_start_balance'] = self.get_usdt_balance()
                         last_reset_date = today
                         print(f"🌅 New trading day ({today}) — counters and circuit breaker reset")
