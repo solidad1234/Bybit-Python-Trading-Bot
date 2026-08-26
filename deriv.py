@@ -55,6 +55,14 @@ except ImportError:
     get_sr_score = None
     HAS_SR_FACTOR = False
 
+# Try importing economic calendar factor
+try:
+    from factors.calendar import get_calendar_status
+    HAS_CALENDAR = True
+except ImportError:
+    get_calendar_status = None
+    HAS_CALENDAR = False
+
 # Load environment variables
 load_dotenv()
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN", "")
@@ -166,6 +174,36 @@ bot_state = {
     # Daily reset tracking
     'last_reset_date': datetime.now(timezone.utc).date(),
 }
+
+
+# ---------------------------------------------------------------------------
+# Post-news 2-candle confirmation helper (Deriv)
+# ---------------------------------------------------------------------------
+
+def _check_post_news_confirmation_deriv(data: dict, signal_direction: str) -> bool:
+    """
+    After a high-impact macro event, confirm the post-news trend is real
+    before entering a Forex trade on Deriv.
+
+    Requires the last 2 closed 15m candles to both close in signal direction.
+    Uses deriv data format (key = "15m").
+
+    Returns True  = confirmed, safe to enter.
+            False = uncertain, skip this cycle.
+    """
+    try:
+        closes = data.get("15m", {}).get("close", [])
+        if len(closes) < 3:
+            return False
+        c1, c2, c3 = float(closes[-3]), float(closes[-2]), float(closes[-1])
+        if signal_direction == "LONG":
+            return c3 > c2 > c1
+        elif signal_direction == "SHORT":
+            return c3 < c2 < c1
+        return False
+    except Exception as e:
+        print(f"⚠️ [deriv] Post-news confirmation check error: {e} — skipping entry")
+        return False
 
 
 def get_forex_news_score(symbol: str) -> dict:
@@ -1236,6 +1274,27 @@ class DerivForexBot:
                 print(f" ⚠️ Could not fetch live price for open position on {symbol}. Skipping management this cycle.")
             return
 
+        # ── Calendar blackout / post-news check (evaluated once per cycle) ──
+        _deriv_post_news_mode = False
+        if HAS_CALENDAR and get_calendar_status is not None:
+            try:
+                cal = get_calendar_status()
+                if cal.get("is_blackout"):
+                    print(f"\n🚫 MACRO BLACKOUT — {cal['block_reason']}")
+                    next_evs = cal.get("next_events", [])
+                    if next_evs:
+                        print("   📅 Upcoming events:")
+                        for ev in next_evs:
+                            print(f"      • {ev['name']} — {ev['time_utc']} ({ev['hours_away']}h away)")
+                    print("✅ Cycle complete (blackout — no entries).")
+                    return
+                _deriv_post_news_mode = cal.get("post_news_mode", False)
+                if _deriv_post_news_mode:
+                    print(f"\n📡 POST-NEWS MODE — {cal['block_reason']}")
+            except Exception as cal_err:
+                print(f"⚠️  [calendar] Error in deriv cycle: {cal_err}")
+                _deriv_post_news_mode = False
+
         for symbol in TRADE_SYMBOLS:
             print(f"\n🔍 Evaluating {symbol}...")
             passed_checks, session_label, spread_pips = self.check_spread_and_session(symbol)
@@ -1255,6 +1314,16 @@ class DerivForexBot:
 
             if signal in ["LONG", "SHORT"]:
                 print(f" ⚡ CONSENSUS SIGNAL DETECTED: {signal} on {symbol}")
+
+                # Post-news confirmation gate
+                if _deriv_post_news_mode:
+                    confirmed = _check_post_news_confirmation_deriv(data, signal)
+                    if not confirmed:
+                        print(f"   ⏳ Post-news confirmation pending — {signal} on {symbol} "
+                              f"not yet confirmed by 2 consecutive 15m candles. Skipping.")
+                        continue
+                    print(f"   ✅ Post-news 2-candle confirmation passed — proceeding with {signal}")
+
                 success = self.execute_trade(symbol, signal, current_price, indicators, signal_data, spread_pips, volatility)
                 if success:
                     break

@@ -1,26 +1,36 @@
 """
 Multi-Factor Signal Aggregator  (factors/aggregator.py)
 ========================================================
-Combines TA + Regime + Derivatives + Sentiment + News into a single
-weighted consensus score.
+Combines Calendar + TA + Regime + Derivatives + Sentiment + News + S/R
+into a single weighted consensus score.
+
+Evaluation order (short-circuits early on hard vetoes):
+  0. Calendar  — temporal blackout gate (pre-event 4h / post-news 90min)
+  1. Technical — RSI/MACD/ADX scoring
+  2. Regime    — macro BTC trend context
+  3. Derivatives — funding + OI + L/S ratio
+  4. Sentiment — contrarian F&G index (1-hour TTL cache)
+  5. News      — two-layer BTC macro + coin blocker/nudge
+  6. S/R       — support/resistance proximity + breakout detection
 
 Weights (must sum to 1.0):
-  regime       0.30  — macro BTC trend context (most reliable crash indicator)
-  derivatives  0.25  — funding + OI + L/S ratio (real money on the line)
-  technical    0.20  — RSI/MACD/ADX scoring from existing system
-  sentiment    0.15  — contrarian F&G index (1-hour TTL cache)
-  news         0.10  — two-layer macro+coin blocker/nudge
+  regime             0.25
+  derivatives        0.22
+  technical          0.20
+  support_resistance 0.15
+  sentiment          0.12
+  news               0.06
 
 Key behaviours:
-  - block_trade      = True  → veto both directions
-  - block_long_only  = True  → LONG blocked, SHORT allowed (news bad-coin logic)
-  - Regime bearish ≤ -0.4   → LONG threshold raised from 0.25 to 0.40
+  - Calendar blackout  → immediate hard veto, all other factors skipped
+  - post_news_mode     → signal passes but futures.py applies 2-candle gate
+  - block_trade        → veto both directions
+  - block_long_only    → LONG blocked, SHORT allowed (news bad-coin logic)
+  - Regime bearish ≤ -0.4 → LONG threshold raised from 0.25 to 0.40
 
 Usage in futures.py:
     from factors.aggregator import MultiFactorAggregator
     agg = MultiFactorAggregator()
-    # precomputed contains pre-fetched regime (and optionally sentiment)
-    # to avoid redundant API calls across the symbol scanner loop.
     consensus = agg.evaluate(ta_signal, symbol, current_price,
                              precomputed={"regime": regime_info})
 """
@@ -32,6 +42,7 @@ from factors.derivatives        import get_derivatives_score
 from factors.sentiment          import get_sentiment_score
 from factors.news               import get_news_score
 from factors.support_resistance import get_sr_score
+from factors.calendar           import get_calendar_status
 
 # Rebalanced to include Support/Resistance at 0.15
 # Total must equal 1.0
@@ -94,6 +105,42 @@ class MultiFactorAggregator:
         print("\n🔬 Running multi-factor evaluation...")
         t0 = time.time()
         precomputed = precomputed or {}
+
+        # ── 0. Calendar: temporal hard veto (checked BEFORE any scoring) ──────
+        try:
+            cal = get_calendar_status()
+        except Exception as cal_err:
+            cal = {"is_blackout": False, "post_news_mode": False,
+                   "block_reason": "", "event_name": "",
+                   "next_events": [], "minutes_to_event": None}
+            print(f"⚠️  [calendar] Error checking calendar: {cal_err}")
+
+        if cal["is_blackout"]:
+            print(f"\n🚫 MACRO BLACKOUT ACTIVE — {cal['block_reason']}")
+            next_evs = cal.get("next_events", [])
+            if next_evs:
+                print("   📅 Upcoming high-impact events:")
+                for ev in next_evs:
+                    print(f"      • {ev['name']} — {ev['time_utc']} ({ev['hours_away']}h away)")
+            return {
+                "signal":          None,
+                "final_score":     0.0,
+                "block_trade":     True,
+                "block_long_only": False,
+                "block_reason":    cal["block_reason"],
+                "post_news_mode":  False,
+                "factor_scores":   {},
+                "elapsed_s":       round(time.time() - t0, 1),
+                "sr_scenario":         "MID_RANGE",
+                "sr_suggested_stop":   None,
+                "sr_suggested_target": None,
+                "sr_suggested_leverage": 10.0,
+            }
+
+        # Log post-news mode so futures.py can apply 2-candle confirmation
+        post_news_mode = cal.get("post_news_mode", False)
+        if post_news_mode:
+            print(f"\n📡 POST-NEWS MODE — {cal['block_reason']}")
 
         factor_scores = {}
 
@@ -226,6 +273,7 @@ class MultiFactorAggregator:
             "block_trade":     block_trade,
             "block_long_only": block_long_only,
             "block_reason":    block_reason,
+            "post_news_mode":  post_news_mode,
             "factor_scores":   factor_scores,
             "elapsed_s":       round(elapsed, 1),
             # S/R pass-through for stop/target/leverage in futures.py
