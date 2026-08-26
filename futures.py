@@ -78,6 +78,51 @@ futures_state = {
     'session_pnl': 0.0,
 }
 
+
+# ---------------------------------------------------------------------------
+# Post-news 2-candle confirmation helper (module-level, tested independently)
+# ---------------------------------------------------------------------------
+
+def _check_post_news_confirmation(data: dict, signal_direction: str) -> bool:
+    """
+    After a high-impact macro event, verify the trend is real before entering.
+
+    Requires the last 2 *closed* 15m candles to both close in the signal
+    direction — confirming the post-news trend rather than trading the spike.
+
+    Parameters
+    ----------
+    data            : dict  Output of fetch_multi_timeframe_data()
+                            (key "15" = primary 15m timeframe klines)
+    signal_direction: str   "LONG" or "SHORT"
+
+    Returns
+    -------
+    bool  True = trend confirmed, safe to enter.
+          False = still uncertain, skip this cycle.
+    """
+    primary_tf = "15"   # must match primary_timeframe constant
+    try:
+        closes = data.get(primary_tf, {}).get("close", [])
+        if len(closes) < 3:
+            # Not enough data — fail safe (don't enter)
+            return False
+
+        # Last 3 closes (most recent is [-1])
+        c1, c2, c3 = float(closes[-3]), float(closes[-2]), float(closes[-1])
+
+        if signal_direction == "LONG":
+            # Both candles closed higher than the one before
+            return c3 > c2 > c1
+        elif signal_direction == "SHORT":
+            # Both candles closed lower than the one before
+            return c3 < c2 < c1
+        return False
+    except Exception as e:
+        print(f"⚠️ Post-news confirmation check failed: {e} — skipping entry (fail-safe)")
+        return False
+
+
 class FuturesTradingBot:
     
     def __init__(self):
@@ -1506,6 +1551,21 @@ class FuturesTradingBot:
                                             data=data)
             if consensus["block_trade"] or consensus["signal"] is None:
                 continue
+
+            # ── Post-news 2-candle confirmation gate ───────────────────────
+            # After a high-impact macro event the market is still settling.
+            # Only enter if the last 2 closed 15m candles both confirm
+            # the signal direction — proving the trend is real, not noise.
+            if consensus.get("post_news_mode", False):
+                confirmed = _check_post_news_confirmation(
+                    data, consensus["signal"]
+                )
+                if not confirmed:
+                    print(f"   ⏳ Post-news confirmation pending — "
+                          f"{consensus['signal']} signal on {current_sym} "
+                          f"not yet confirmed by 2 consecutive 15m candles. Skipping.")
+                    continue
+                print(f"   ✅ Post-news 2-candle confirmation passed — proceeding with {consensus['signal']}")
 
             score_abs = abs(consensus["final_score"])
             print(f"   ✅ {consensus['signal']} Passed! Score: {consensus['final_score']:+.3f}")
