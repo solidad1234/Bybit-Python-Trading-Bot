@@ -23,6 +23,7 @@ import pandas as pd
 from datetime import datetime, timezone, timedelta
 
 FEATURE_COLUMNS = [
+    "symbol_id",          # ordinal asset identity (0=SOL,1=ETH,2=BNB,3=LINK,4=BTC,5=NEAR,6=INJ)
     "is_long",
     "ta_signal_strength",
     "aggregated_score",
@@ -39,6 +40,11 @@ FEATURE_COLUMNS = [
     "regime_is_bull",
     "regime_is_bear",
 ]
+
+SYMBOL_ID_MAP = {
+    "SOLUSDT": 0, "ETHUSDT": 1, "BNBUSDT": 2, "LINKUSDT": 3,
+    "BTCUSDT": 4, "NEARUSDT": 5, "INJUSDT": 6,
+}
 
 
 class DecisionNode:
@@ -250,6 +256,14 @@ def preprocess_features(df):
     else:
         raise ValueError("Dataset missing 'net_pnl' or 'result' column for training target.")
 
+    # Symbol identity encoding
+    if "symbol_id" in data.columns:
+        data["symbol_id"] = pd.to_numeric(data["symbol_id"], errors="coerce").fillna(-1).astype(int)
+    elif "symbol" in data.columns:
+        data["symbol_id"] = data["symbol"].map(SYMBOL_ID_MAP).fillna(-1).astype(int)
+    else:
+        data["symbol_id"] = -1
+
     data["is_long"] = (data["direction"] == "LONG").astype(int)
     data["trend_bull_4h"] = (data["market_trend_4h"] == "BULL").astype(int)
     data["regime_is_bull"] = (data["regime_class"] == "BULL").astype(int)
@@ -275,72 +289,129 @@ def preprocess_features(df):
         else:
             data[col] = default_val
 
-    X = data[FEATURE_COLUMNS].copy().values
+    # Drop rows where critical features are still NaN
+    data = data.dropna(subset=["volatility", "atr_15m", "ta_signal_strength"]).reset_index(drop=True)
+
+    X = data[FEATURE_COLUMNS].copy().values.astype(float)
     y = data["target"].values.astype(int)
 
     return X, y, data
+
+
+def _cross_validate(X, y, n_folds=5):
+    """Time-series aware k-fold cross-validation. Returns mean accuracy per fold."""
+    n = len(X)
+    fold_size = n // n_folds
+    accs = []
+    print(f"\n{'='*60}")
+    print(f"5-FOLD TIME-SERIES CROSS-VALIDATION")
+    print(f"{'='*60}")
+    for fold in range(n_folds):
+        test_start = fold * fold_size
+        test_end   = test_start + fold_size if fold < n_folds - 1 else n
+        train_end  = test_start
+        if train_end < 20:
+            continue  # not enough train data
+        X_tr, y_tr = X[:train_end], y[:train_end]
+        X_te, y_te = X[test_start:test_end], y[test_start:test_end]
+        m = RandomForestClassifierCustom(n_estimators=50, max_depth=3, min_samples_split=8)
+        m.fit(X_tr, y_tr)
+        probs = m.predict_proba(X_te)[:, 1]
+        acc = np.mean((probs >= 0.5) == y_te) * 100
+        wr_te  = np.mean(y_te) * 100
+        accs.append(acc)
+        print(f"  Fold {fold+1}: train={len(X_tr)} | test={len(X_te)} | WinRate={wr_te:.0f}% | Acc={acc:.1f}%")
+    mean_acc = np.mean(accs) if accs else 0.0
+    print(f"  {'─'*50}")
+    print(f"  Mean CV Accuracy: {mean_acc:.1f}%  ({'✅ Above coin-flip' if mean_acc > 52 else '⚠️ Near coin-flip — needs more data'})")
+    return mean_acc
 
 
 def train_model(X, y, df_raw):
     print("\n" + "=" * 60)
     print("TRAINING MACHINE LEARNING MODEL (TRADE QUALITY GATE)")
     print("=" * 60)
-    print(f"Dataset Size: {len(X)} trade samples")
-    print(f"Class Distribution: {np.sum(y == 1)} Wins (1) | {np.sum(y == 0)} Losses/Scratches (0)")
-    print(f"Baseline Win Rate: {np.mean(y) * 100:.1f}%\n")
+    print(f"Dataset Size:      {len(X)} trade samples")
+    print(f"Feature Count:     {len(FEATURE_COLUMNS)} features")
+    print(f"Wins (y=1):        {np.sum(y == 1)} ({np.mean(y)*100:.1f}%)")
+    print(f"Losses (y=0):      {np.sum(y == 0)} ({(1-np.mean(y))*100:.1f}%)")
 
+    # ── 5-Fold Cross-Validation ────────────────────────────────────────────
+    cv_acc = _cross_validate(X, y, n_folds=5)
+
+    # ── Final model trained on 75% / evaluated on last 25% ────────────────
     split_idx = int(len(X) * 0.75)
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
     df_test = df_raw.iloc[split_idx:].copy()
 
-    model = RandomForestClassifierCustom(n_estimators=30, max_depth=4, min_samples_split=4)
+    # Tighter regularization to reduce overfitting
+    model = RandomForestClassifierCustom(n_estimators=50, max_depth=3, min_samples_split=8)
     model.fit(X_train, y_train)
 
-    probs_test = model.predict_proba(X_test)[:, 1]
+    probs_train = model.predict_proba(X_train)[:, 1]
+    probs_test  = model.predict_proba(X_test)[:, 1]
 
-    test_acc = np.mean((probs_test >= 0.5) == y_test) * 100
+    train_acc = np.mean((probs_train >= 0.5) == y_train) * 100
+    test_acc  = np.mean((probs_test  >= 0.5) == y_test)  * 100
 
+    print("\n" + "=" * 60)
+    print("FINAL MODEL EVALUATION")
     print("=" * 60)
-    print("OUT-OF-SAMPLE MODEL EVALUATION ON TEST SET")
-    print("=" * 60)
-    print(f"Test Set Accuracy:  {test_acc:.1f}%")
+    print(f"Training Accuracy:    {train_acc:.1f}%")
+    print(f"Test Accuracy:        {test_acc:.1f}%")
+    print(f"CV Mean Accuracy:     {cv_acc:.1f}%")
+    gap = train_acc - test_acc
+    print(f"Train-Test Gap:       {gap:.1f}% {'✅ OK' if gap < 12 else '⚠️ Overfitting'}")
 
+    # Confusion matrix
+    tp = np.sum((probs_test >= 0.5) & (y_test == 1))
+    tn = np.sum((probs_test <  0.5) & (y_test == 0))
+    fp = np.sum((probs_test >= 0.5) & (y_test == 0))
+    fn = np.sum((probs_test <  0.5) & (y_test == 1))
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    print(f"Precision:            {precision:.3f}")
+    print(f"Recall:               {recall:.3f}")
+    print(f"F1 Score:             {f1:.3f}")
+
+    df_test = df_test.copy()
     df_test["win_prob"] = probs_test
     df_test["ml_pass"] = probs_test >= 0.55
 
     orig_pnl = df_test["net_pnl"].sum()
     ml_filtered_pnl = df_test[df_test["ml_pass"]]["net_pnl"].sum()
-
     orig_trades = len(df_test)
     ml_trades = int(np.sum(df_test["ml_pass"]))
-
     orig_wr = np.mean(df_test["net_pnl"] > 0) * 100
     ml_wr = np.mean(df_test[df_test["ml_pass"]]["net_pnl"] > 0) * 100 if ml_trades > 0 else 0.0
 
     print("\n" + "=" * 60)
     print("REAL-WORLD PNL IMPROVEMENT WITH ML FILTER")
     print("=" * 60)
-    print(f"Original Trades Taken:   {orig_trades} trades")
-    print(f"Original Win Rate:       {orig_wr:.1f}%")
-    print(f"Original Test PnL:       ${orig_pnl:+.2f}")
-    print("------------------------------------------------------------")
-    print(f"ML Filtered Trades:      {ml_trades} trades (Skipped {orig_trades - ml_trades} bad setups)")
-    print(f"ML Filtered Win Rate:    {ml_wr:.1f}%")
-    print(f"ML Filtered Test PnL:    ${ml_filtered_pnl:+.2f}")
+    print(f"Original Trades Taken:   {orig_trades} | Win Rate: {orig_wr:.1f}% | PnL: ${orig_pnl:+.2f}")
+    print(f"ML Filtered Trades:      {ml_trades} (Skipped {orig_trades - ml_trades}) | Win Rate: {ml_wr:.1f}% | PnL: ${ml_filtered_pnl:+.2f}")
     print("=" * 60)
 
     feat_imp = pd.DataFrame({"Feature": FEATURE_COLUMNS, "Importance": model.feature_importances_})
     feat_imp = feat_imp.sort_values("Importance", ascending=False).reset_index(drop=True)
+    dead = feat_imp[feat_imp['Importance'] < 0.001]
+    active = feat_imp[feat_imp['Importance'] >= 0.001]
 
-    print("\n" + "=" * 60)
-    print("TOP PREDICTORS OF WINNING TRADES (FEATURE IMPORTANCE)")
-    print("=" * 60)
-    for idx, row in feat_imp.iterrows():
+    print(f"\n{'='*60}")
+    print(f"FEATURE IMPORTANCES ({len(active)}/{len(FEATURE_COLUMNS)} active, {len(dead)} dead)")
+    print(f"{'='*60}")
+    for _, row in feat_imp.iterrows():
         bar = "█" * int(row["Importance"] * 40)
-        print(f"{row['Feature']:<22} | {row['Importance']:.4f} {bar}")
+        status = "" if row["Importance"] >= 0.001 else "  ← DEAD"
+        print(f"  {row['Feature']:<22} | {row['Importance']:.4f}  {bar}{status}")
 
-    # Save dictionary JSON/pickle representation
+    if len(dead) > 0:
+        print(f"\n  ⚠️ {len(dead)} dead features — consider running a longer backtest (365 days)")
+        print(f"     to generate enough trade samples with diverse factor values.")
+
+    # Save model artifact
     model_path = "xgboost_filter.pkl"
     with open(model_path, "wb") as f:
         pickle.dump(model.to_dict(), f)
