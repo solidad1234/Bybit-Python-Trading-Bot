@@ -36,6 +36,8 @@ BYBIT_MKT_URL   = "https://api.bybit.com/v5/market"
 
 # ---- Multi-Asset Universe Configuration (7 Coins) ----
 TRADE_SYMBOLS = ["SOLUSDT", "ETHUSDT", "BNBUSDT", "LINKUSDT", "BTCUSDT", "NEARUSDT", "INJUSDT"]
+# Ordinal encoding for symbol identity (so ML model can learn per-asset patterns)
+SYMBOL_ID_MAP = {sym: idx for idx, sym in enumerate(TRADE_SYMBOLS)}
 PRIMARY_TF = "15"
 HIGHER_TF = "60"
 
@@ -598,6 +600,7 @@ def run_multi_asset_backtest(symbols, start_ms, end_ms, starting_balance, no_fac
                         "balance_after":      round(balance, 2),
 
                         # Rich multi-factor feature set for XGBoost training
+                        "symbol_id":          fc.get("symbol_id", SYMBOL_ID_MAP.get(sym, -1)),
                         "ta_signal_strength": fc.get("ta_signal_strength"),
                         "aggregated_score":   fc.get("aggregated_score"),
                         "volatility":         fc.get("volatility"),
@@ -607,6 +610,7 @@ def run_multi_asset_backtest(symbols, start_ms, end_ms, starting_balance, no_fac
                         "derivatives_score":  fc.get("derivatives_score"),
                         "sentiment_score":    fc.get("sentiment_score"),
                         "news_score":         fc.get("news_score"),
+                        "sr_score":           fc.get("sr_score"),
                         "regime_class":       fc.get("regime_class"),
                         "funding_rate":       fc.get("funding_rate"),
                         "market_trend_4h":    fc.get("market_trend_4h"),
@@ -739,11 +743,12 @@ def run_multi_asset_backtest(symbols, start_ms, end_ms, starting_balance, no_fac
                                 "derivatives_score":  mf_details["derivatives_score"],
                                 "sentiment_score":    mf_details["sentiment_score"],
                                 "news_score":         mf_details["news_score"],
-                                "sr_score":           mf_details.get("sr_score", 0.0),
+                                "sr_score":           mf_details["sr_score"],
                                 "sr_scenario":        sr_res.get("scenario", "MID_RANGE"),
                                 "regime_class":       mf_details["regime_class"],
                                 "funding_rate":       mf_details["funding_rate"],
                                 "market_trend_4h":    trend_4h,
+                                "symbol_id":          SYMBOL_ID_MAP.get(sym, -1),
                             }
                         }
 

@@ -1,4 +1,5 @@
 [
+  "symbol_id",
   "is_long",
   "ta_signal_strength",
   "aggregated_score",
