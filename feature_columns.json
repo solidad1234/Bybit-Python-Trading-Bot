@@ -1,0 +1,17 @@
+[
+  "is_long",
+  "ta_signal_strength",
+  "aggregated_score",
+  "volatility",
+  "atr_15m",
+  "technical_score",
+  "regime_score",
+  "derivatives_score",
+  "sentiment_score",
+  "news_score",
+  "sr_score",
+  "funding_rate",
+  "trend_bull_4h",
+  "regime_is_bull",
+  "regime_is_bear"
+]

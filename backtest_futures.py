@@ -34,8 +34,8 @@ from factors.support_resistance import detect_sr_levels_from_arrays
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_MKT_URL   = "https://api.bybit.com/v5/market"
 
-# ---- Multi-Asset Universe Configuration ----
-TRADE_SYMBOLS = ["SOLUSDT", "ETHUSDT", "AVAXUSDT", "LINKUSDT", "BNBUSDT"]
+# ---- Multi-Asset Universe Configuration (7 Coins) ----
+TRADE_SYMBOLS = ["SOLUSDT", "ETHUSDT", "BNBUSDT", "LINKUSDT", "BTCUSDT", "NEARUSDT", "INJUSDT"]
 PRIMARY_TF = "15"
 HIGHER_TF = "60"
 
@@ -49,11 +49,13 @@ TAKER_FEE = 0.00055
 FUNDING_RATE_PER_8H = 0.0001   # fallback when historical funding unavailable
 
 CONTRACT_SPECS = {
-    "SOLUSDT":  {"min_size": 0.1,  "step_size": 0.1,  "decimals": 1},
-    "ETHUSDT":  {"min_size": 0.01, "step_size": 0.01, "decimals": 2},
-    "AVAXUSDT": {"min_size": 0.1,  "step_size": 0.1,  "decimals": 1},
-    "LINKUSDT": {"min_size": 0.1,  "step_size": 0.1,  "decimals": 1},
-    "BNBUSDT":  {"min_size": 0.01, "step_size": 0.01, "decimals": 2},
+    "SOLUSDT":  {"min_size": 0.1,   "step_size": 0.1,   "decimals": 1},
+    "ETHUSDT":  {"min_size": 0.01,  "step_size": 0.01,  "decimals": 2},
+    "BNBUSDT":  {"min_size": 0.01,  "step_size": 0.01,  "decimals": 2},
+    "LINKUSDT": {"min_size": 0.1,   "step_size": 0.1,   "decimals": 1},
+    "BTCUSDT":  {"min_size": 0.001, "step_size": 0.001, "decimals": 3},
+    "NEARUSDT": {"min_size": 0.1,   "step_size": 0.1,   "decimals": 1},
+    "INJUSDT":  {"min_size": 0.1,   "step_size": 0.1,   "decimals": 1},
 }
 
 # ---- Multi-factor weights (mirrors factors/aggregator.py) ----

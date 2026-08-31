@@ -135,8 +135,9 @@ def _check_post_news_confirmation(data: dict, signal_direction: str) -> bool:
 
 class FuturesTradingBot:
     
-    def __init__(self):
+    def __init__(self, with_ml=False):
         print(f"🚀 Initializing Futures Trading Bot...")
+        self.with_ml = with_ml
         self.init_db()
         self.load_position_state()
         self.load_bot_state()       # restores last_trade_time across restarts
@@ -602,6 +603,73 @@ class FuturesTradingBot:
             print(f"✅ Trade logged — PnL: ${pnl:.2f}  Result: {result}")
         except Exception as e:
             print(f"⚠️ Error logging outcome: {e}")
+
+    def check_ml_quality_gate(self, direction, factor_context, threshold=0.55):
+        """
+        Inference gate using trained xgboost_filter.pkl model.
+        Returns (allowed: bool, win_probability: float).
+        If model file does not exist, defaults to (True, 1.0) (pass-through).
+        """
+        model_path = "xgboost_filter.pkl"
+        cols_path = "feature_columns.json"
+
+        if not os.path.exists(model_path) or not os.path.exists(cols_path):
+            return True, 1.0
+
+        try:
+            import pickle
+            import json
+            import pandas as pd
+            import train_futures_xgboost
+            with open(model_path, "rb") as f:
+                model_data = pickle.load(f)
+
+            if isinstance(model_data, dict):
+                model = train_futures_xgboost.RandomForestClassifierCustom.from_dict(model_data)
+            else:
+                model = model_data
+
+            with open(cols_path, "r") as f:
+                feature_cols = json.load(f)
+
+            fc = factor_context or {}
+            is_long = 1 if direction == "LONG" else 0
+            trend_bull = 1 if fc.get("market_trend_4h") == "BULL" else 0
+            regime_class = fc.get("regime_class", "NEUTRAL")
+            regime_is_bull = 1 if regime_class == "BULL" else 0
+            regime_is_bear = 1 if regime_class == "BEAR" else 0
+
+            feat_dict = {
+                "is_long": is_long,
+                "ta_signal_strength": float(fc.get("ta_signal_strength") or 4.0),
+                "aggregated_score": float(fc.get("aggregated_score") or 0.25),
+                "volatility": float(fc.get("volatility") or 0.02),
+                "atr_15m": float(fc.get("atr_15m") or 1.0),
+                "technical_score": float(fc.get("technical_score") or 0.2),
+                "regime_score": float(fc.get("regime_score") or 0.0),
+                "derivatives_score": float(fc.get("derivatives_score") or 0.0),
+                "sentiment_score": float(fc.get("sentiment_score") or 0.0),
+                "news_score": float(fc.get("news_score") or 0.0),
+                "sr_score": float(fc.get("sr_score") or 0.0),
+                "funding_rate": float(fc.get("funding_rate") or 0.0001),
+                "trend_bull_4h": trend_bull,
+                "regime_is_bull": regime_is_bull,
+                "regime_is_bear": regime_is_bear,
+            }
+
+            df_in = pd.DataFrame([feat_dict])[feature_cols]
+            X_in = df_in.values.astype(float)
+            prob_win = float(model.predict_proba(X_in)[0, 1])
+
+            if prob_win >= threshold:
+                print(f"🤖 ML Quality Gate: PASSED (P(WIN) = {prob_win*100:.1f}% >= {threshold*100:.1f}%)")
+                return True, prob_win
+            else:
+                print(f"🚫 ML Quality Gate: REJECTED setup (P(WIN) = {prob_win*100:.1f}% < {threshold*100:.1f}%)")
+                return False, prob_win
+        except Exception as e:
+            print(f"⚠️ ML Quality Gate evaluation error: {e} — defaulting to PASS")
+            return True, 1.0
         
     def initialize_balance(self):
         """Initialize futures trading balance"""
@@ -1629,6 +1697,16 @@ class FuturesTradingBot:
         # ── Execute the Best Setup ──────────────────────────────────────────
         if best_setup:
             print(f"\n🏆 WINNING SETUP: {best_setup['signal']} on {best_setup['symbol']} (Score: {best_score:.3f})")
+
+            # ── ML Quality Gate (Meta-Filter) ──────────────────────────────
+            if self.with_ml:
+                ml_allowed, prob_win = self.check_ml_quality_gate(
+                    best_setup["signal"], best_setup["context"], threshold=0.55
+                )
+                if not ml_allowed:
+                    print(f"🚫 ML Quality Gate blocked trade on {best_setup['symbol']} (P(WIN) = {prob_win*100:.1f}% < 55%). Skipping.")
+                    return None
+
             self.place_futures_order(
                 {"signal": best_setup["signal"], "strength": best_setup["strength"], "leverage": best_setup["leverage"]}, 
                 best_setup["current_price"], 
@@ -1679,6 +1757,7 @@ class FuturesTradingBot:
         print(f"🎯 Signal Threshold: {signal_strength_threshold}/10")
         print(f"💰 Max Leverage: {max_leverage:.1f}x")
         print(f"🎯 Reward Ratio: {min_reward_ratio:.1f}:1 minimum")
+        print(f"🤖 ML Quality Gate: {'ENABLED (--with-ml active)' if self.with_ml else 'DISABLED (Pure Rule Engine default)'}")
         print("="*80)
         
         cycle_count = 0
@@ -1758,5 +1837,10 @@ class FuturesTradingBot:
                 time.sleep(30)
 
 if __name__ == "__main__":
-    bot = FuturesTradingBot()
+    import argparse
+    parser = argparse.ArgumentParser(description="Bybit Futures Trading Bot")
+    parser.add_argument("--with-ml", action="store_true", help="Enable Machine Learning Quality Gate filter")
+    args = parser.parse_args()
+
+    bot = FuturesTradingBot(with_ml=args.with_ml)
     bot.run_bot()
