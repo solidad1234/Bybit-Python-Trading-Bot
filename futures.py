@@ -26,19 +26,29 @@ load_dotenv()
 api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
-# Trading Configuration
-TRADE_SYMBOLS = ["SOLUSDT", "ETHUSDT", "AVAXUSDT", "LINKUSDT", "BNBUSDT"]
+# Trading Configuration — 7-Coin Diversified Universe
+TRADE_SYMBOLS = [
+    "SOLUSDT",   # Proven #1 Performer (+$6.50, 83% win rate)
+    "ETHUSDT",   # Core Anchor (Controlled risk)
+    "BNBUSDT",   # Positive PnL (+$2.31)
+    "LINKUSDT",  # Clean breakout history
+    "BTCUSDT",   # Benchmark (Ultra-deep liquidity, zero manipulation risk)
+    "NEARUSDT",  # AVAX Replacement (Clean 4h L1 trend legs)
+    "INJUSDT",   # High R:R Momentum Follower
+]
 
-# Per-symbol Bybit linear contract specs (last verified 2026-08)
+# Per-symbol Bybit linear contract specs (last verified 2026-08 against Bybit V5 API)
 # min_qty  : minimum order size in base coin units
 # step_size: order size increment
 # ticker   : human-readable base coin label for log messages
 SYMBOL_CONTRACT_SPECS = {
-    "SOLUSDT":  {"min_qty": 0.1,  "step_size": 0.1,  "ticker": "SOL"},
-    "ETHUSDT":  {"min_qty": 0.01, "step_size": 0.01, "ticker": "ETH"},
-    "AVAXUSDT": {"min_qty": 0.1,  "step_size": 0.1,  "ticker": "AVAX"},
-    "LINKUSDT": {"min_qty": 0.1,  "step_size": 0.1,  "ticker": "LINK"},
-    "BNBUSDT":  {"min_qty": 0.01, "step_size": 0.01, "ticker": "BNB"},
+    "SOLUSDT":  {"min_qty": 0.1,   "step_size": 0.1,   "ticker": "SOL"},
+    "ETHUSDT":  {"min_qty": 0.01,  "step_size": 0.01,  "ticker": "ETH"},
+    "BNBUSDT":  {"min_qty": 0.01,  "step_size": 0.01,  "ticker": "BNB"},
+    "LINKUSDT": {"min_qty": 0.1,   "step_size": 0.1,   "ticker": "LINK"},
+    "BTCUSDT":  {"min_qty": 0.001, "step_size": 0.001, "ticker": "BTC"},
+    "NEARUSDT": {"min_qty": 0.1,   "step_size": 0.1,   "ticker": "NEAR"},
+    "INJUSDT":  {"min_qty": 0.1,   "step_size": 0.1,   "ticker": "INJ"},
 }
 primary_timeframe = "15"   # Primary analysis
 higher_timeframe = "60"    # Trend confirmation
@@ -585,6 +595,10 @@ class FuturesTradingBot:
             ))
 
             self.conn.commit()
+            try:
+                self.cursor.execute('PRAGMA wal_checkpoint(PASSIVE);')
+            except Exception:
+                pass
             print(f"✅ Trade logged — PnL: ${pnl:.2f}  Result: {result}")
         except Exception as e:
             print(f"⚠️ Error logging outcome: {e}")
