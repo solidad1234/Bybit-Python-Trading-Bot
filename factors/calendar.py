@@ -195,6 +195,11 @@ def _refresh_fmp_cache_if_stale():
         print("📅 [calendar] No FMP_API_KEY — using RSS-only event detection (free, real-time)")
         return
 
+    # Skip silently if the key was already rejected as plan-restricted (403)
+    if api_key == "__PLAN_RESTRICTED__":
+        _cache["fetched_at"] = now  # reset timer so we don't spam the check
+        return
+
     events = _fetch_fmp_events(api_key)
     _cache["events"]     = events
     _cache["fetched_at"] = now
@@ -225,6 +230,20 @@ def _fetch_fmp_events(api_key: str) -> list:
             },
             timeout=10,
         )
+
+        # ── Handle 403 cleanly: economic_calendar is a paid FMP endpoint ──
+        if resp.status_code == 403:
+            _cache["last_error"] = "403 — economic_calendar requires FMP paid plan"
+            print(
+                "📅 [calendar] FMP economic_calendar is a premium endpoint (HTTP 403).\n"
+                "   Your free plan does not include it. This is expected.\n"
+                "   RSS-based event detection is active and fully covers macro events.\n"
+                "   To enable FMP: upgrade at https://site.financialmodelingprep.com/"
+            )
+            # Mark key as unusable so we don't burn quota on retries
+            _cache["fmp_key"] = "__PLAN_RESTRICTED__"
+            return []
+
         resp.raise_for_status()
         raw = resp.json()
 
@@ -271,8 +290,12 @@ def _fetch_fmp_events(api_key: str) -> list:
         return events
 
     except requests.exceptions.RequestException as e:
-        _cache["last_error"] = str(e)
-        print(f"⚠️  [calendar] FMP fetch failed: {e} — RSS fallback active")
+        # Mask the API key from the error string before printing
+        err_str = str(e)
+        if api_key and api_key in err_str:
+            err_str = err_str.replace(api_key, "***")
+        _cache["last_error"] = err_str
+        print(f"⚠️  [calendar] FMP fetch failed ({err_str[:80]}) — RSS fallback active")
         return []
     except Exception as e:
         _cache["last_error"] = str(e)
@@ -356,6 +379,10 @@ def _detect_via_rss() -> dict:
             title = entry.get("title", "").lower()
             for pattern, event_name in MACRO_EVENT_PATTERNS:
                 if re.search(pattern, title, re.IGNORECASE):
+                    # Log the exact headline that triggered the detection for auditability
+                    raw_title = entry.get('title', '(no title)')
+                    pub_time  = entry.get('published', 'unknown time')
+                    print(f"📅 [calendar] RSS match: '{raw_title[:100]}' (published: {pub_time})")
                     return {
                         "is_blackout":     False,   # event is NOW — trade the reaction
                         "post_news_mode":  True,
@@ -377,7 +404,11 @@ def _detect_via_rss() -> dict:
 
 
 def _filter_recent_entries(entries: list, cutoff: datetime) -> list:
-    """Filter RSS entries to those published after `cutoff`."""
+    """Filter RSS entries to those published after `cutoff`.
+    FIX: On timestamp parse failure, EXCLUDE the entry (fail-closed).
+    Including unparseable entries was a staleness risk — old articles with
+    broken timestamps would bypass the 45-minute window.
+    """
     recent = []
     for entry in entries:
         try:
@@ -392,7 +423,9 @@ def _filter_recent_entries(entries: list, cutoff: datetime) -> list:
             if pub >= cutoff:
                 recent.append(entry)
         except Exception:
-            recent.append(entry)  # include on parse failure — better than missing events
+            # FIX: EXCLUDE entries with unparseable timestamps instead of blindly including them.
+            # A stale article with a broken date is worse than a missed fresh one.
+            pass
     return recent
 
 

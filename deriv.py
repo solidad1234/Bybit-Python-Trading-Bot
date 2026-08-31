@@ -168,11 +168,13 @@ bot_state = {
     'available_balance': 1000.0,
     'session_start_balance': 0.0,
     'session_pnl': 0.0,
-    # Graceful halt flag
+    # Graceful halt flag — persisted to SQLite so restarts don't bypass it
     'halt': False,
     'halt_reason': '',
     # Daily reset tracking
     'last_reset_date': datetime.now(timezone.utc).date(),
+    # Trade gap: min hours between trades (persisted across restarts)
+    'min_trade_gap_hours': 2.0,
 }
 
 
@@ -267,10 +269,11 @@ class DerivForexBot:
         self.connected = False
         self.ws = None
         self.state_file = 'deriv_trading_state.json'
-        
+
         self.init_db()
-        self.init_deriv_connection()
-        self.load_position_state()
+        self.init_deriv_connection()   # Connect first so _is_contract_open works in load_position_state
+        self.load_position_state()     # Verifies recovered contract is still open on Deriv
+        self.load_bot_state()          # Restores halt flag, consecutive_losses, last_trade_time
         self.initialize_balance()
 
     # ── Deriv WebSocket Communication Helpers ─────────────────────────────
@@ -377,27 +380,48 @@ class DerivForexBot:
 
     def _is_contract_open(self, contract_id: str) -> bool:
         """Query Deriv portfolio to verify a contract is still active server-side.
-        Returns True if open (or unknown), False if already closed by Deriv.
+        Retries up to 3 times with backoff before making a decision.
+        Returns True if confirmed open, False if confirmed closed or unknown after retries.
+
+        IMPORTANT: Changed from fail-open (True) to fail-closed (False) after retries
+        to prevent duplicate trades when WS recovers and old contract is already gone.
         """
-        if not self.connected or not contract_id or str(contract_id).startswith("DRY_RUN"):
-            return True  # Assume open for dry-run or unverifiable IDs
-        try:
-            portfolio_res = self._send_request({"portfolio": 1}, timeout=8.0)
-            if portfolio_res and "portfolio" in portfolio_res:
-                contracts = portfolio_res["portfolio"].get("contracts", [])
-                open_ids = {str(c.get("contract_id", "")) for c in contracts}
-                is_open = contract_id in open_ids
-                if not is_open:
-                    print(f" \u26a0\ufe0f Contract {contract_id} is no longer in Deriv portfolio — already closed server-side.")
-                return is_open
-        except Exception as e:
-            print(f" \u26a0\ufe0f Portfolio check error: {e}. Assuming contract is still open.")
-        return True  # Safe default: do not force-close if check fails
+        if not contract_id or str(contract_id).startswith("DRY_RUN"):
+            return True  # Dry-run IDs are always treated as open
+        if not self.connected:
+            print(" ⚠️ _is_contract_open: Not connected — treating contract as closed (fail-safe).")
+            return False  # FIX: was True; returning True caused duplicate trades on reconnect
+
+        for attempt in range(1, 4):  # 3 attempts with backoff
+            try:
+                portfolio_res = self._send_request({"portfolio": 1}, timeout=10.0)
+                if portfolio_res and "portfolio" in portfolio_res:
+                    contracts = portfolio_res["portfolio"].get("contracts", [])
+                    open_ids = {str(c.get("contract_id", "")) for c in contracts}
+                    is_open = contract_id in open_ids
+                    if not is_open:
+                        print(f" ⚠️ Contract {contract_id} NOT in Deriv portfolio — closed server-side.")
+                    return is_open
+                # Got a response but no 'portfolio' key — unexpected; retry
+                print(f" ⚠️ Portfolio check attempt {attempt}/3: unexpected response. Retrying...")
+            except Exception as e:
+                print(f" ⚠️ Portfolio check attempt {attempt}/3 failed: {e}")
+            time.sleep(2 * attempt)  # 2s, 4s, 6s backoff
+
+        # All 3 attempts failed — cannot confirm contract is open.
+        # FIX: Treat as CLOSED (fail-safe) to prevent phantom position blocking new entry
+        # AND to prevent managing a position that no longer exists on the exchange.
+        print(f" 🚫 Could not verify contract {contract_id} after 3 attempts — treating as CLOSED.")
+        return False
 
     def _halt_bot(self, reason: str):
-        """Gracefully halt the bot: set flag, flush DB, close WebSocket."""
+        """Gracefully halt the bot: set flag, persist to SQLite, close WebSocket.
+        FIX: halt flag is now written to the DB so restarts respect it.
+        """
         bot_state['halt'] = True
         bot_state['halt_reason'] = reason
+        # Persist halt to DB — critical so restart does not bypass the halt
+        self.save_bot_state()
         try:
             self.conn.commit()
             self.conn.close()
@@ -408,6 +432,70 @@ class DerivForexBot:
                 self.ws.close()
         except Exception:
             pass
+
+    def save_bot_state(self):
+        """Persist halt flag, consecutive_losses, and last_trade_time to SQLite.
+        Called after every trade close and on halt. Mirrors futures.py pattern.
+        """
+        entries = [
+            ('halt',                str(int(bot_state.get('halt', False)))),
+            ('halt_reason',         bot_state.get('halt_reason', '')),
+            ('consecutive_losses',  str(bot_state.get('consecutive_losses', 0))),
+            ('last_trade_time',     bot_state['last_trade_time'].isoformat()
+                                    if isinstance(bot_state.get('last_trade_time'), datetime)
+                                    else ''),
+        ]
+        try:
+            for key, value in entries:
+                self.cursor.execute(
+                    'INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)',
+                    (key, value)
+                )
+            self.conn.commit()
+        except Exception as e:
+            print(f"⚠️ Could not persist bot_state: {e}")
+
+    def load_bot_state(self):
+        """Restore halt flag, consecutive_losses, and last_trade_time from SQLite.
+        Called in __init__ AFTER load_position_state().
+        """
+        try:
+            rows = self.cursor.execute('SELECT key, value FROM bot_state').fetchall()
+            kv = {r[0]: r[1] for r in rows}
+
+            # Restore halt — if the bot was halted before restart, stay halted
+            if kv.get('halt') == '1':
+                bot_state['halt'] = True
+                bot_state['halt_reason'] = kv.get('halt_reason', 'UNKNOWN (from previous session)')
+                print(f"🛑 RESTORED HALT STATE from DB: {bot_state['halt_reason']}")
+                print("   Bot will not trade until halt is manually cleared (delete bot_state rows).")
+
+            # Restore consecutive losses
+            if 'consecutive_losses' in kv:
+                try:
+                    bot_state['consecutive_losses'] = int(kv['consecutive_losses'])
+                    if bot_state['consecutive_losses'] > 0:
+                        print(f"⚠️ Restored consecutive_losses = {bot_state['consecutive_losses']} from DB")
+                except ValueError:
+                    pass
+
+            # Restore last_trade_time — enforces trade gap across restarts
+            if kv.get('last_trade_time'):
+                try:
+                    ltt = datetime.fromisoformat(kv['last_trade_time'])
+                    bot_state['last_trade_time'] = ltt
+                    hours_ago = (datetime.now(timezone.utc) - ltt).total_seconds() / 3600
+                    gap = bot_state.get('min_trade_gap_hours', 2.0)
+                    if hours_ago < gap:
+                        remaining = gap - hours_ago
+                        print(f"⏳ Trade gap restored: last trade {hours_ago:.1f}h ago "
+                              f"({remaining:.1f}h remaining before next entry allowed)")
+                    else:
+                        print(f"✅ Trade gap satisfied: last trade {hours_ago:.1f}h ago — ready to trade")
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"⚠️ Could not load bot_state from DB: {e}")
 
     def init_deriv_connection(self):
         """Establish WebSocket connection with Deriv API supporting both PAT (REST OTP) and legacy WS auth."""
@@ -490,6 +578,15 @@ class DerivForexBot:
             self.cursor.execute('PRAGMA busy_timeout=30000;')
         except Exception as e:
             print(f"⚠️ Could not set WAL/busy_timeout PRAGMA: {e}")
+
+        # ── bot_state KV table: persists halt, losses, last_trade_time ────────
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        self.conn.commit()
 
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS position (
@@ -605,14 +702,18 @@ class DerivForexBot:
             print(f"⚠️ Error saving position state to SQLite: {e}")
 
     def load_position_state(self):
-        """Load position state from SQLite"""
+        """Load position state from SQLite on startup.
+        FIX: Now also restores stake_amount and multiplier — critical for correct
+        PnL calculation when close_position() is called after a restart.
+        Also verifies the recovered contract is still open on Deriv before trusting it.
+        """
         try:
             self.cursor.execute('SELECT * FROM position LIMIT 1')
             row = self.cursor.fetchone()
             if row:
                 columns = [col[0] for col in self.cursor.description]
                 r = dict(zip(columns, row))
-                bot_state['position'] = {
+                recovered_pos = {
                     'symbol': r.get('symbol'),
                     'direction': r.get('direction'),
                     'size': r.get('size'),
@@ -626,9 +727,23 @@ class DerivForexBot:
                     'stop_moved_to_be': bool(r.get('stop_moved_to_be', False)),
                     'original_stop': r.get('original_stop'),
                     'highest_price': r.get('highest_price'),
-                    'lowest_price': r.get('lowest_price')
+                    'lowest_price': r.get('lowest_price'),
+                    # FIX: Restore these fields so PnL is correct after restart
+                    'stake_amount': r.get('stake_amount'),
+                    'multiplier': r.get('multiplier') or 100,
                 }
-                print(f"🔄 Recovered active Deriv position: {bot_state['position']['direction']} {bot_state['position']['symbol']}")
+                print(f"🔄 Recovered position from DB: {recovered_pos['direction']} {recovered_pos['symbol']} "
+                      f"(order_id={recovered_pos['order_id']})")
+
+                # FIX: Verify with Deriv before trusting the recovered position.
+                # _is_contract_open now retries 3x and fails CLOSED on persistent failure.
+                contract_id = str(recovered_pos.get('order_id', ''))
+                if not self._is_contract_open(contract_id):
+                    print("⚠️ Recovered position contract is NO LONGER OPEN on Deriv. Clearing stale DB state.")
+                    self.clear_position_state()
+                else:
+                    bot_state['position'] = recovered_pos
+                    print(f"✅ Deriv confirmed contract {contract_id} is still open.")
             else:
                 bot_state['position'] = None
         except Exception as e:
@@ -975,6 +1090,24 @@ class DerivForexBot:
 
     def execute_trade(self, symbol, direction, entry_price, indicators, signal_data, spread_pips=0.0, volatility=0.0):
         """Execute Forex Trade (via Deriv WS API or Dry-Run)"""
+        # FIX: Hard guard — NEVER open a new trade if one is already active.
+        # This is the last line of defense against concurrent positions.
+        if bot_state.get('position'):
+            existing = bot_state['position']
+            print(f"🚫 SAFETY GUARD: Position already open "
+                  f"({existing.get('direction')} {existing.get('symbol')}, "
+                  f"order_id={existing.get('order_id')}). Aborting new trade on {symbol}.")
+            return False
+
+        # FIX: Enforce minimum trade gap (2h) — prevents immediate re-entry after a loss.
+        ltt = bot_state.get('last_trade_time')
+        if ltt is not None:
+            hours_since = (datetime.now(timezone.utc) - ltt).total_seconds() / 3600
+            gap = bot_state.get('min_trade_gap_hours', 2.0)
+            if hours_since < gap:
+                print(f"⏳ Trade gap not met: last trade {hours_since:.1f}h ago "
+                      f"(need {gap}h). Skipping {direction} on {symbol}.")
+                return False
         pip_size = SYMBOL_SPECS.get(symbol, {}).get("pip_size", 0.0001)
         atr_15m  = indicators["15m"]["atr"]
 
@@ -1168,8 +1301,10 @@ class DerivForexBot:
 
         # Correct PnL: Deriv Multiplier contract formula
         # pnl = stake * multiplier * (price_change / entry_price)
-        stake      = pos.get('stake_amount', pos.get('size', 1.0))
-        multiplier = pos.get('multiplier', 100)
+        # FIX: stake_amount is now always restored from DB on load_position_state().
+        # Fallback chain: stake_amount → explicit 1.0 (never use 'size'=lots as stake).
+        stake      = pos.get('stake_amount') or 1.0
+        multiplier = pos.get('multiplier') or 100
         if direction == "LONG":
             pnl = stake * multiplier * (exit_price - entry) / entry
         else:
@@ -1206,6 +1341,11 @@ class DerivForexBot:
         win_rate = (bot_state['winning_trades'] / bot_state['total_trades'] * 100) if bot_state['total_trades'] > 0 else 0.0
         print(f" 📊 Session Stats — Trades: {bot_state['total_trades']} | Win Rate: {win_rate:.0f}% | Session PnL: ${bot_state['session_pnl']:.2f} | Consec. Losses: {bot_state['consecutive_losses']}")
         self.clear_position_state()
+
+        # Record trade time and persist state so restart respects trade gap and halt
+        bot_state['last_trade_time'] = datetime.now(timezone.utc)
+        self.save_bot_state()          # FIX: persist losses, trade time, halt state
+
         self.initialize_balance()  # Refresh real balance after trade
 
         max_daily_loss = bot_state['session_start_balance'] * MAX_DAILY_LOSS_PCT
@@ -1220,6 +1360,12 @@ class DerivForexBot:
 
     def run_cycle(self):
         """Single polling cycle across supported Forex symbols."""
+        # ── 0. Halt check — must be first, before any market activity ──────
+        if bot_state.get('halt'):
+            print(f"🛑 Bot is HALTED ({bot_state.get('halt_reason', 'unknown')}). "
+                  f"No trading this cycle. Clear the 'halt' key in the bot_state table to resume.")
+            return
+
         # ── 1. Ensure WebSocket is alive before doing anything ─────────────
         self._ensure_connected()
 
@@ -1229,8 +1375,11 @@ class DerivForexBot:
             print(f"🌅 New trading day ({today}). Resetting session stats.")
             bot_state['session_pnl']          = 0.0
             bot_state['daily_trades']          = 0
+            bot_state['consecutive_losses']    = 0  # Fresh slate each day
             bot_state['session_start_balance'] = bot_state['available_balance']
             bot_state['last_reset_date']       = today
+            # Clear persisted halt/loss state for new day
+            self.save_bot_state()
 
         print(f"\n🔄 --- Running Deriv Forex Cycle [{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] ---")
 
