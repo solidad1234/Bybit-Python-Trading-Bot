@@ -55,9 +55,9 @@ WEIGHTS = {
     "news":               0.06,   # two-layer macro+coin blocker
 }
 
-LONG_ENTRY_THRESHOLD          = 0.25
+LONG_ENTRY_THRESHOLD          = 0.30   # raised from 0.25 — filters flat-macro low-quality LONGs
 SHORT_ENTRY_THRESHOLD         = 0.15
-LONG_THRESHOLD_BEARISH_REGIME = 0.40   # elevated when regime_score <= -0.4
+LONG_THRESHOLD_BEARISH_REGIME = 0.45   # elevated when regime_score <= -0.4 (raised from 0.40)
 
 # ---------------------------------------------------------------------------
 # 1-hour sentiment TTL cache (F&G updates once per day — no need to fetch 5x)

@@ -35,7 +35,7 @@ BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 BYBIT_MKT_URL   = "https://api.bybit.com/v5/market"
 
 # ---- Multi-Asset Universe Configuration (7 Coins) ----
-TRADE_SYMBOLS = ["SOLUSDT", "ETHUSDT", "BNBUSDT", "LINKUSDT", "BTCUSDT", "NEARUSDT", "INJUSDT"]
+TRADE_SYMBOLS = ["SOLUSDT", "ETHUSDT", "BNBUSDT", "LINKUSDT", "BTCUSDT", "INJUSDT"]
 # Ordinal encoding for symbol identity (so ML model can learn per-asset patterns)
 SYMBOL_ID_MAP = {sym: idx for idx, sym in enumerate(TRADE_SYMBOLS)}
 PRIMARY_TF = "15"
@@ -56,7 +56,6 @@ CONTRACT_SPECS = {
     "BNBUSDT":  {"min_size": 0.01,  "step_size": 0.01,  "decimals": 2},
     "LINKUSDT": {"min_size": 0.1,   "step_size": 0.1,   "decimals": 1},
     "BTCUSDT":  {"min_size": 0.001, "step_size": 0.001, "decimals": 3},
-    "NEARUSDT": {"min_size": 0.1,   "step_size": 0.1,   "decimals": 1},
     "INJUSDT":  {"min_size": 0.1,   "step_size": 0.1,   "decimals": 1},
 }
 
@@ -130,7 +129,9 @@ def build_indicators(df):
     volume = df["volume"].values
 
     out = pd.DataFrame(index=df.index)
-    out["rsi"] = talib.RSI(close, timeperiod=14)
+    rsi_vals = talib.RSI(close, timeperiod=14)
+    out["rsi"] = rsi_vals
+    out["rsi_prev"] = pd.Series(rsi_vals, index=df.index).shift(1).values
     macd, macd_signal, macd_hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
     out["macd"] = macd
     out["macd_signal"] = macd_signal
@@ -317,9 +318,28 @@ def compute_multi_factor_details(
 # Signal / stop / sizing logic - mirrors futures.py exactly
 # ----------------------------------------------------------------------
 def calculate_signal(row15, row1h, row4h, volatility, regime_score=0.0):
-    """Calculate futures trading signals with hard 4h trend gate and dynamic LONG threshold."""
-    trend_bullish = (not pd.isna(row4h["ema_21"])) and row4h["ema_21"] > row4h["ema_50"]
-    trend_bearish = (not pd.isna(row4h["ema_21"])) and row4h["ema_21"] < row4h["ema_50"]
+    """Calculate futures trading signals with 3-zone 4h trend gate and RSI bounce confirmation."""
+    ema21_4h = row4h.get("ema_21")
+    ema50_4h = row4h.get("ema_50")
+
+    # 3-Zone 4h Trend Classification (Fix 2b)
+    if not pd.isna(ema21_4h) and not pd.isna(ema50_4h) and ema50_4h > 0:
+        ema_gap_pct = (ema21_4h - ema50_4h) / ema50_4h
+        if ema_gap_pct > 0.005:
+            trend_bullish = True
+            trend_bearish = False
+        elif ema_gap_pct < -0.005:
+            trend_bullish = False
+            trend_bearish = True
+        else:  # Neutral chop zone (|gap| <= 0.5%)
+            trend_bullish = (regime_score > 0.3)  # Only allow LONG in neutral 4h if macro regime is STRONG BULL
+            trend_bearish = False
+    else:
+        trend_bullish = True
+        trend_bearish = True
+
+    rsi_prev_val = row15.get("rsi_prev")
+    rsi_turning_up = (not pd.isna(rsi_prev_val)) and (row15["rsi"] > rsi_prev_val)
 
     long_conditions = [
         row15["rsi"] < 40,
@@ -329,6 +349,7 @@ def calculate_signal(row15, row1h, row4h, volatility, regime_score=0.0):
         row15["volume_ratio"] > 1.3,
         volatility > 0.02,
         row15["adx"] > 18,
+        rsi_turning_up,  # Fix 3: RSI bounce confirmation
     ]
     short_conditions = [
         row15["rsi"] > 65,
@@ -347,7 +368,10 @@ def calculate_signal(row15, row1h, row4h, volatility, regime_score=0.0):
 
     min_long_score = 5 if regime_score <= -0.4 else 4
 
-    if long_score >= min_long_score and trend_bullish:
+    # ── Regime gate: only allow LONGs when macro environment is at least mildly
+    # bullish. Empirically, regime_score <= 0.0 produces negative EV trades
+    # (WR: WEAK_BEAR=25%, STRONG_BEAR=14%) — never trade LONGs in flat/bear macro.
+    if long_score >= min_long_score and trend_bullish and regime_score > 0.0:
         return {"signal": "LONG",  "strength": long_score,  "leverage": 10.0}
     if short_score >= 6 and trend_bearish:
         return {"signal": "SHORT", "strength": short_score, "leverage": 10.5}
