@@ -28,12 +28,11 @@ api_secret = os.getenv("API_SECRET")
 
 # Trading Configuration — 7-Coin Diversified Universe
 TRADE_SYMBOLS = [
-    "SOLUSDT",   # Proven #1 Performer (+$6.50, 83% win rate)
-    "ETHUSDT",   # Core Anchor (Controlled risk)
-    "BNBUSDT",   # Positive PnL (+$2.31)
+    "SOLUSDT",   # Proven #1 Performer (+$4.73, 63% win rate)
+    "ETHUSDT",   # Core Anchor (+$1.93, best backtest RR=1.66)
+    "BNBUSDT",   # Positive PnL (+$1.35)
     "LINKUSDT",  # Clean breakout history
     "BTCUSDT",   # Benchmark (Ultra-deep liquidity, zero manipulation risk)
-    "NEARUSDT",  # AVAX Replacement (Clean 4h L1 trend legs)
     "INJUSDT",   # High R:R Momentum Follower
 ]
 
@@ -757,7 +756,9 @@ class FuturesTradingBot:
             volumes = prices['volume']
             
             # TA-Lib calculations
-            rsi = talib.RSI(closes, timeperiod=14)[-1]
+            rsi_series = talib.RSI(closes, timeperiod=14)
+            rsi = rsi_series[-1]
+            rsi_prev = rsi_series[-2] if len(rsi_series) > 1 else rsi
             macd_line, macd_signal, macd_hist = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)
             ema_21 = talib.EMA(closes, timeperiod=21)[-1]
             ema_50 = talib.EMA(closes, timeperiod=50)[-1]
@@ -769,6 +770,7 @@ class FuturesTradingBot:
             
             indicators[tf] = {
                 'rsi': rsi,
+                'rsi_prev': rsi_prev,
                 'macd': macd_line[-1],
                 'macd_signal': macd_signal[-1],
                 'macd_histogram': macd_hist[-1],
@@ -843,24 +845,37 @@ class FuturesTradingBot:
         ema21_4h = ind4h.get("ema_21", None)
         ema50_4h = ind4h.get("ema_50", None)
 
-        # Hard trend gates — fall back to allowing both if 4h data unavailable
+        # 3-Zone 4h Trend Classification (Fix 2b)
         if ema21_4h is not None and ema50_4h is not None and ema50_4h > 0:
-            trend_bullish = ema21_4h > ema50_4h   # 4h uptrend
-            trend_bearish = ema21_4h < ema50_4h   # 4h downtrend
+            ema_gap_pct = (ema21_4h - ema50_4h) / ema50_4h
+            if ema_gap_pct > 0.005:
+                trend_bullish = True
+                trend_bearish = False
+            elif ema_gap_pct < -0.005:
+                trend_bullish = False
+                trend_bearish = True
+            else:  # Neutral chop zone (|gap| <= 0.5%)
+                trend_bullish = (regime_score > 0.3)  # Only allow LONG in neutral 4h if macro regime is STRONG BULL
+                trend_bearish = False
         else:
             print("⚠️  4h EMA unavailable — trend gate relaxed for this cycle")
             trend_bullish = True
             trend_bearish = True
 
-        # Futures LONG conditions (7 conditions, need 5+)
+        rsi_15m = indicators["15m"]["rsi"]
+        rsi_15m_prev = indicators["15m"].get("rsi_prev", rsi_15m)
+        rsi_turning_up = rsi_15m > rsi_15m_prev
+
+        # Futures LONG conditions (8 conditions, need 4+ or 5+)
         futures_long_conditions = [
-            indicators["15m"]["rsi"] < 40,
+            rsi_15m < 40,
             indicators["1h"]["rsi"] < 50,
             indicators["15m"]["macd"] > indicators["15m"]["macd_signal"],
             current_price > indicators["15m"]["ema_21"] * 0.998,
             indicators["15m"]["volume_ratio"] > 1.3,
             volatility > 0.02,
             indicators["15m"]["adx"] > 18,
+            rsi_turning_up,  # Fix 3: RSI bounce confirmation
         ]
 
         # Futures SHORT conditions (10 conditions, need 6+)
@@ -884,19 +899,22 @@ class FuturesTradingBot:
         min_long_score = 5 if regime_score <= -0.4 else 4
 
         # Log 4h trend context
-        trend_label = "BULL" if trend_bullish else ("BEAR" if trend_bearish else "FLAT")
+        trend_label = "BULL" if trend_bullish else ("BEAR" if trend_bearish else "FLAT/CHOP")
         print(f"   4h Trend: {trend_label}  (EMA21={ema21_4h:.2f} {'>' if trend_bullish else '<'} EMA50={ema50_4h:.2f})" if ema21_4h else "   4h Trend: UNKNOWN")
-        print(f"   LONG score={long_score}/7 (min {min_long_score})  SHORT score={short_score}/10")
+        print(f"   LONG score={long_score}/8 (min {min_long_score})  SHORT score={short_score}/10")
 
-        # Hard gate: TA signal is only valid when 4h trend aligns
-        if long_score >= min_long_score and trend_bullish:
+        # Hard gate: TA signal is only valid when 4h trend aligns AND macro regime supports
+        # Regime gate: regime_score <= 0.0 = flat/bear macro — empirically negative EV on LONGs
+        if long_score >= min_long_score and trend_bullish and regime_score > 0.0:
             return {"signal": "LONG",  "strength": long_score,  "leverage": 10.0}
         if short_score >= 6 and trend_bearish:
             return {"signal": "SHORT", "strength": short_score, "leverage": 10.5}
 
         # Log why signal was blocked
         if long_score >= min_long_score and not trend_bullish:
-            print(f"   🚫 LONG blocked — 4h trend is bearish (EMA21 < EMA50)")
+            print(f"   🚫 LONG blocked — 4h trend is bearish/chop (EMA21 vs EMA50 gap neutral)")
+        if long_score >= min_long_score and trend_bullish and regime_score <= 0.0:
+            print(f"   🚫 LONG blocked — macro regime flat/bearish (score={regime_score:.2f} ≤ 0.0, need > 0.0)")
         if short_score >= 6 and not trend_bearish:
             print(f"   🚫 SHORT blocked — 4h trend is bullish (EMA21 > EMA50)")
 
@@ -1348,7 +1366,7 @@ class FuturesTradingBot:
             # Track the lowest price reached (best for SHORT)
             if 'lowest_price' not in position or current_price < position['lowest_price']:
                 position['lowest_price'] = current_price
-                print(f"📉 New best SHORT price: ${current_price:.{price_precision}f}")
+                print(f"📉 NEW {position.get('symbol', '')} SHORT price: ${current_price:.{price_precision}f}")
                 self.save_position_state()
 
             best_price = position['lowest_price']
@@ -1369,7 +1387,7 @@ class FuturesTradingBot:
             # Track the highest price reached (best for LONG)
             if 'highest_price' not in position or current_price > position['highest_price']:
                 position['highest_price'] = current_price
-                print(f"📈 New best LONG price: ${current_price:.{price_precision}f}")
+                print(f"📈 NEW {position.get('symbol', '')} LONG price: ${current_price:.{price_precision}f}")
                 self.save_position_state()
 
             best_price = position['highest_price']
@@ -1662,7 +1680,7 @@ class FuturesTradingBot:
                 trend_4h  = "BULL" if ind4h_now.get("ema_21", 0) > ind4h_now.get("ema_50", 0) else "BEAR"
                 
                 context = {
-                    "ta_signal_strength":  signal.get("strength"),
+                    "ta_signal_strength":  float(signal.get("strength") or 0),
                     "aggregated_score":    consensus.get("final_score"),
                     "volatility":          volatility,
                     "atr_15m":             indicators["15m"]["atr"],
