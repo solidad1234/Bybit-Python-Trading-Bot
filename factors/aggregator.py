@@ -268,7 +268,7 @@ class MultiFactorAggregator:
 
             if block_long_only and ta_direction == "LONG":
                 consensus_signal = None
-                print(f"   🚫 LONG blocked by news: {block_reason}")
+                print(f"   🚫 LONG blocked: {block_reason}")
 
         elapsed = time.time() - t0
         self._print_summary(
