@@ -225,6 +225,18 @@ class MultiFactorAggregator:
                 block_long_only = True
                 block_reason    = news_fs.get("block_reason", "news: LONG blocked")
 
+        # A support touch is not a bounce by itself. Do not allow the positive
+        # TA/regime factors to override an unconfirmed support reaction.
+        sr_fs = factor_scores.get("support_resistance", {})
+        if (
+            not block_trade
+            and ta_signal.get("signal") == "LONG"
+            and sr_fs.get("scenario") == "AT_SUPPORT"
+            and not sr_fs.get("details", {}).get("support_reaction_confirmed", False)
+        ):
+            block_long_only = True
+            block_reason = "support_resistance: LONG blocked until support reaction confirms"
+
         # --- Weighted composite score ---
         final_score = 0.0
         for name, fs in factor_scores.items():

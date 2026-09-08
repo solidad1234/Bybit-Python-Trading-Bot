@@ -42,6 +42,7 @@ AT_LEVEL_ATR_MULT   = 0.8    # within this × ATR_15m = "at the level"
 MIN_STOP_ATR_MULT   = 0.8    # minimum stop distance = price × this × ATR
 STOP_CLEARANCE_ATR  = 0.4    # clearance beyond level for stop placement
 VOLUME_CONFIRM_MULT = 1.5    # volume must be this × SMA to confirm breakout
+SUPPORT_REACTION_MIN_ATR = 0.15  # minimum close rebound above support before LONG
 SWING_WINDOW_1H     = 5      # candles each side for 1h swing detection
 SWING_WINDOW_4H     = 3      # candles each side for 4h swing detection
 CLUSTER_TOL         = 0.005  # 0.5% clustering tolerance
@@ -131,6 +132,17 @@ def get_sr_score(symbol: str, current_price: float,
             current_price, nearest_sup, nearest_res, atr_15m, volume_ratio,
         )
 
+        support_reaction_confirmed = True
+        if scenario == "AT_SUPPORT":
+            support_reaction_confirmed = _support_reaction_confirmed(
+                data.get("15", {}).get("close", np.array([])),
+                current_price,
+                nearest_sup["price"] if nearest_sup else None,
+                atr_15m,
+            )
+            if not support_reaction_confirmed:
+                score = -0.10
+
         # --- Suggest S/R-anchored stops and targets ---
         sug_stop, sug_target, sug_lev = _suggest_stops_targets(
             scenario, current_price, nearest_sup, nearest_res, atr_15m, clustered,
@@ -158,6 +170,7 @@ def get_sr_score(symbol: str, current_price: float,
                 "scenario":       scenario,
                 "atr_15m":        round(atr_15m, 4),
                 "volume_ratio":   round(volume_ratio, 2),
+                "support_reaction_confirmed": support_reaction_confirmed,
             },
         }
 
@@ -300,6 +313,22 @@ def _classify_scenario(price, nearest_sup, nearest_res, atr, volume_ratio):
 
     # ── Mid-range — small penalty (no clear edge) ─────────────────────────────
     return "MID_RANGE", -0.10
+
+
+def _support_reaction_confirmed(closes, current_price, support_price, atr):
+    """Require a small two-candle rebound before allowing a support LONG."""
+    if support_price is None or atr <= 0 or len(closes) < 3:
+        return False
+
+    previous_close = float(closes[-2])
+    latest_close = float(closes[-1])
+    rebound = latest_close - support_price
+    return (
+        latest_close > previous_close
+        and previous_close > float(closes[-3])
+        and rebound >= SUPPORT_REACTION_MIN_ATR * atr
+        and latest_close >= current_price
+    )
 
 
 # ---------------------------------------------------------------------------
