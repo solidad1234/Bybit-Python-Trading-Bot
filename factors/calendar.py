@@ -78,21 +78,34 @@ MACRO_EVENT_PATTERNS = [
     (r"\bfomc\b",                        "FOMC Meeting", "very_high"),
     (r"federal reserve.{0,30}(rate|decision|statement|minutes|powell)",
                                          "Federal Reserve", "very_high"),
-    (r"(interest rate|rate decision|rate hike|rate cut).{0,20}(fed|fomc|us|united states)",
+    (r"\b(?:fed|fomc|federal reserve)\b.{0,45}\b(?:raises? rates?|"
+     r"cuts? rates?|holds? rates?|keeps? rates?|rate decision.{0,20}"
+     r"(?:announced|confirmed|result|vote)|(?:announced|confirmed).{0,15}"
+     r"(?:rate hike|rate cut))\b",
                                          "Fed Rate Decision", "very_high"),
-    (r"\bjackson hole\b",                "Jackson Hole Symposium", "very_high"),
+    (r"(?:\bjackson hole\b.{0,60}\b(?:speech|speaks|remarks|address|keynote|"
+     r"powell|warsh|federal reserve|fed chair|opens?|begins?|starts?|underway)\b|"
+     r"\b(?:speech|speaks|remarks|address|keynote|powell|warsh|federal reserve|"
+     r"fed chair)\b.{0,60}\bjackson hole\b)",
+                                         "Jackson Hole Symposium", "very_high"),
     (r"fed chair.{0,20}(speech|speaks|address|testif)",
                                          "Fed Chair Speech", "very_high"),
 
     # Inflation
     (r"(?:\b(us|u\.s\.|united states|america|american)\b.{0,35}\bcpi\b|"
-     r"\bcpi\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)",
+     r"\bcpi\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)"
+     r".{0,45}\b(?:released|release|reported|report|came in|printed|print|"
+     r"rose|fell|higher|lower|surprise|beat|missed|data showed)\b",
                                          "US CPI Release", "very_high"),
     (r"(?:\b(us|u\.s\.|united states|america|american)\b.{0,35}\bpce\b|"
-     r"\bpce\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)",
+     r"\bpce\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)"
+     r".{0,45}\b(?:released|release|reported|report|came in|printed|print|"
+     r"rose|fell|higher|lower|surprise|beat|missed|data showed)\b",
                                          "PCE Inflation", "very_high"),
     (r"(?:\b(us|u\.s\.|united states|america|american)\b.{0,35}\bppi\b|"
-     r"\bppi\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)",
+     r"\bppi\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)"
+     r".{0,45}\b(?:released|release|reported|report|came in|printed|print|"
+     r"rose|fell|higher|lower|surprise|beat|missed|data showed)\b",
                                          "US PPI", "high"),
 
     # Employment
@@ -132,7 +145,10 @@ MACRO_EVENT_PATTERNS = [
     # Other major releases
     (r"\bism\b.{0,20}(manufacturing|services|pmi)",
                                          "ISM PMI", "high"),
-    (r"retail sales.{0,20}(us|united states|data|report)",
+    (r"(?:\b(us|u\.s\.|united states|america|american)\b.{0,35}\bretail sales\b|"
+     r"\bretail sales\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)"
+     r".{0,45}\b(?:released|release|reported|report|came in|printed|print|"
+     r"rose|fell|higher|lower|surprise|beat|missed|data showed)\b",
                                          "US Retail Sales", "high"),
     (r"(?:\b(european|eurozone|euro area|eu)\b.{0,35}\bretail sales\b|"
      r"\bretail sales\b.{0,35}\b(european|eurozone|euro area|eu)\b)",
