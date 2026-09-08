@@ -69,55 +69,82 @@ GOOGLE_NEWS_RSS   = "https://news.google.com/rss/search"
 RSS_LOOKBACK_MINS = 45     # scan headlines from last 45 min for live event detection
 
 # ---------------------------------------------------------------------------
-# Source B: high-impact macro event keyword patterns
-# These trigger post_news_mode when found in live news headlines.
-# New events are detected automatically as long as they appear in headlines.
+# Source B: macro event keyword patterns
+# Only HIGH and VERY_HIGH events trigger post_news_mode. Lower-impact events
+# remain available to the ordinary news scorer but never pause trading here.
 # ---------------------------------------------------------------------------
 MACRO_EVENT_PATTERNS = [
     # Fed / interest rates
-    (r"\bfomc\b",                        "FOMC Meeting"),
+    (r"\bfomc\b",                        "FOMC Meeting", "very_high"),
     (r"federal reserve.{0,30}(rate|decision|statement|minutes|powell)",
-                                         "Federal Reserve"),
+                                         "Federal Reserve", "very_high"),
     (r"(interest rate|rate decision|rate hike|rate cut).{0,20}(fed|fomc|us|united states)",
-                                         "Fed Rate Decision"),
-    (r"\bjackson hole\b",                "Jackson Hole Symposium"),
+                                         "Fed Rate Decision", "very_high"),
+    (r"\bjackson hole\b",                "Jackson Hole Symposium", "very_high"),
     (r"fed chair.{0,20}(speech|speaks|address|testif)",
-                                         "Fed Chair Speech"),
+                                         "Fed Chair Speech", "very_high"),
 
     # Inflation
-    (r"\bcpi\b.{0,30}(release|data|report|inflation|us|united states)",
-                                         "US CPI Release"),
-    (r"\bpce\b.{0,30}(inflation|price|index|release)",
-                                         "PCE Inflation"),
-    (r"\bppi\b.{0,30}(us|united states|release|data)",
-                                         "US PPI"),
+    (r"(?:\b(us|u\.s\.|united states|america|american)\b.{0,35}\bcpi\b|"
+     r"\bcpi\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)",
+                                         "US CPI Release", "very_high"),
+    (r"(?:\b(us|u\.s\.|united states|america|american)\b.{0,35}\bpce\b|"
+     r"\bpce\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)",
+                                         "PCE Inflation", "very_high"),
+    (r"(?:\b(us|u\.s\.|united states|america|american)\b.{0,35}\bppi\b|"
+     r"\bppi\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)",
+                                         "US PPI", "high"),
 
     # Employment
-    (r"non.?farm.{0,10}payroll",         "Non-Farm Payrolls (NFP)"),
+    (r"non.?farm.{0,10}payroll",         "Non-Farm Payrolls (NFP)", "very_high"),
     (r"\bnfp\b.{0,20}(data|release|report)",
-                                         "NFP Jobs Report"),
+                                         "NFP Jobs Report", "very_high"),
     (r"jobless claims.{0,20}(surge|spike|jump|plunge|drop|rise|fall|high|low)",
-                                         "Jobless Claims"),
+                                         "Jobless Claims", "high"),
     (r"unemployment.{0,30}(rate|data|us|report)",
-                                         "US Unemployment"),
+                                         "US Unemployment", "high"),
 
     # GDP / growth
-    (r"\bgdp\b.{0,30}(us|united states|revised|revision|growth|shrink|q[1-4])",
-                                         "US GDP"),
-    (r"gross domestic product.{0,20}(us|united states|revised)",
-                                         "US GDP"),
+    # Country context is required. A generic "GDP revised" headline is not
+    # enough to classify the release as US GDP.
+    (r"(?:\b(us|u\.s\.|united states|america|american)\b.{0,35}\bgdp\b|"
+     r"\bgdp\b.{0,35}\b(us|u\.s\.|united states|america|american)\b)",
+                                         "US GDP", "high"),
+    (r"(?:\b(japan|japanese)\b.{0,35}\bgdp\b|"
+     r"\bgdp\b.{0,35}\b(japan|japanese)\b)",
+                                         "Japan GDP", "medium_low"),
+    (r"(?:\b(china|chinese)\b.{0,35}\bgdp\b|"
+     r"\bgdp\b.{0,35}\b(china|chinese)\b)",
+                                         "China GDP", "high"),
+    (r"(?:\b(china|chinese)\b.{0,35}\b(pmi|purchasing managers? index)\b|"
+     r"\b(pmi|purchasing managers? index)\b.{0,35}\b(china|chinese)\b)",
+                                         "China PMI", "medium_high"),
+    (r"(?:\b(eurozone|euro area|european union|eu)\b.{0,35}\bgdp\b|"
+     r"\bgdp\b.{0,35}\b(eurozone|euro area|european union|eu)\b)",
+                                         "Eurozone GDP", "medium_low"),
+    (r"(?:\b(germany|german)\b.{0,35}\bgdp\b|"
+     r"\bgdp\b.{0,35}\b(germany|german)\b)",
+                                         "Germany GDP", "low"),
+    (r"(?:\b(uk|u\.k\.|britain|british|united kingdom)\b.{0,35}\bgdp\b|"
+     r"\bgdp\b.{0,35}\b(uk|u\.k\.|britain|british|united kingdom)\b)",
+                                         "UK GDP", "medium"),
 
     # Other major releases
     (r"\bism\b.{0,20}(manufacturing|services|pmi)",
-                                         "ISM PMI"),
+                                         "ISM PMI", "high"),
     (r"retail sales.{0,20}(us|united states|data|report)",
-                                         "US Retail Sales"),
+                                         "US Retail Sales", "high"),
+    (r"(?:\b(european|eurozone|euro area|eu)\b.{0,35}\bretail sales\b|"
+     r"\bretail sales\b.{0,35}\b(european|eurozone|euro area|eu)\b)",
+                                         "European Retail Sales", "low"),
     (r"consumer confidence.{0,20}(us|drop|surge|fell|rose)",
-                                         "US Consumer Confidence"),
-    (r"debt ceiling",                    "US Debt Ceiling"),
+                                         "US Consumer Confidence", "high"),
+    (r"debt ceiling",                    "US Debt Ceiling", "very_high"),
     (r"(treasury|bond|yield).{0,20}(crash|spike|crisis|10.year)",
-                                         "Treasury / Bond Crisis"),
+                                         "Treasury / Bond Crisis", "very_high"),
 ]
+
+POST_NEWS_IMPACTS = {"high", "very_high"}
 
 # ---------------------------------------------------------------------------
 # Module-level cache (FMP only — RSS is always real-time)
@@ -364,7 +391,8 @@ def _detect_via_rss() -> dict:
         query   = (
             "FOMC OR \"Federal Reserve\" OR \"interest rate\" "
             "OR CPI OR NFP OR \"non-farm payroll\" OR GDP OR PCE "
-            "OR \"Jackson Hole\" OR \"Fed Chair\" OR PPI OR \"jobless claims\""
+            "OR \"Jackson Hole\" OR \"Fed Chair\" OR PPI OR \"jobless claims\" "
+            "OR PMI OR \"retail sales\" OR hawkish OR dovish"
         )
         url  = f"{GOOGLE_NEWS_RSS}?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
         feed = feedparser.parse(url)
@@ -377,30 +405,39 @@ def _detect_via_rss() -> dict:
 
         for entry in recent:
             title = entry.get("title", "").lower()
-            for pattern, event_name in MACRO_EVENT_PATTERNS:
-                if re.search(pattern, title, re.IGNORECASE):
-                    # Log the exact headline that triggered the detection for auditability
-                    raw_title = entry.get('title', '(no title)')
-                    pub_time  = entry.get('published', 'unknown time')
-                    print(f"📅 [calendar] RSS match: '{raw_title[:100]}' (published: {pub_time})")
-                    return {
-                        "is_blackout":     False,   # event is NOW — trade the reaction
-                        "post_news_mode":  True,
-                        "event_name":      event_name,
-                        "event_time":      None,
-                        "minutes_to_event": 0.0,
-                        "block_reason": (
-                            f"📡 RSS detected [{event_name}] in live headlines. "
-                            f"Post-news mode: 2-candle confirmation required before entry."
-                        ),
-                        "next_events": [],
-                    }
+            event = _classify_macro_headline(title)
+            if event and event["impact"] in POST_NEWS_IMPACTS:
+                # Log the exact headline that triggered the detection for auditability
+                raw_title = entry.get('title', '(no title)')
+                pub_time  = entry.get('published', 'unknown time')
+                print(f"📅 [calendar] RSS match: '{raw_title[:100]}' (published: {pub_time})")
+                return {
+                    "is_blackout":     False,   # event is NOW — trade the reaction
+                    "post_news_mode":  True,
+                    "event_name":      event["name"],
+                    "event_impact":    event["impact"],
+                    "event_time":      None,
+                    "minutes_to_event": 0.0,
+                    "block_reason": (
+                        f"📡 RSS detected [{event['name']}] in live headlines. "
+                        f"Post-news mode: 2-candle confirmation required before entry."
+                    ),
+                    "next_events": [],
+                }
 
         return _empty_rss_result()
 
     except Exception as e:
         print(f"⚠️  [calendar] RSS detection error: {e} — skipping")
         return _empty_rss_result()
+
+
+def _classify_macro_headline(title: str) -> dict | None:
+    """Return the first matching event's name and impact tier."""
+    for pattern, event_name, impact in MACRO_EVENT_PATTERNS:
+        if re.search(pattern, title, re.IGNORECASE):
+            return {"name": event_name, "impact": impact}
+    return None
 
 
 def _filter_recent_entries(entries: list, cutoff: datetime) -> list:
@@ -434,6 +471,7 @@ def _empty_rss_result() -> dict:
         "is_blackout":     False,
         "post_news_mode":  False,
         "event_name":      "",
+        "event_impact":    None,
         "event_time":      None,
         "minutes_to_event": None,
         "block_reason":    "",

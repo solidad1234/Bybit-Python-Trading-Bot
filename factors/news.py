@@ -41,6 +41,7 @@ LOOKBACK_HOURS   = 6          # wider window since RSS is slower than live API
 BLOCK_THRESHOLD  = 0.55       # |score| above this triggers a block flag
 KEYWORD_WEIGHT   = 0.25       # score contribution per keyword hit
 MAX_ARTICLES     = 15         # cap to avoid overwhelming keyword scorer
+MACRO_PHRASE_WEIGHT = 0.25    # crypto direction of rate-policy language
 
 MACRO_WEIGHT = 0.40
 COIN_WEIGHT  = 0.60
@@ -88,6 +89,20 @@ NEGATIVE_KEYWORDS = {
     "outage", "down", "offline", "bug", "issue", "delay", "congestion",
     "halt", "halted", "suspend", "suspended",
 }
+
+# For crypto risk assets, policy language is directional: hawkish/tighter
+# generally pressures prices, while dovish/easier policy generally supports
+# them. These affect the news score only; calendar.py controls trading pauses.
+HAWKISH_MACRO_PHRASES = (
+    "hawkish", "tightening", "monetary tightening", "rate hike",
+    "rate hikes", "raises rates", "higher rates", "higher for longer",
+    "restrictive policy", "restrictive stance",
+)
+
+DOVISH_MACRO_PHRASES = (
+    "dovish", "easing", "monetary easing", "rate cut", "rate cuts",
+    "cuts rates", "lower rates", "policy pivot", "accommodative policy",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +265,12 @@ def _score_by_keywords(entries: list):
         pos_hits = words & POSITIVE_KEYWORDS
         neg_hits = words & NEGATIVE_KEYWORDS
 
-        article_score = (len(pos_hits) - len(neg_hits)) * KEYWORD_WEIGHT
+        keyword_score = (len(pos_hits) - len(neg_hits)) * KEYWORD_WEIGHT
+        title_lower = title.lower()
+        hawkish_hits = sum(title_lower.count(phrase) for phrase in HAWKISH_MACRO_PHRASES)
+        dovish_hits = sum(title_lower.count(phrase) for phrase in DOVISH_MACRO_PHRASES)
+        macro_score = (dovish_hits - hawkish_hits) * MACRO_PHRASE_WEIGHT
+        article_score = keyword_score + macro_score
         article_score = max(-1.0, min(1.0, article_score))
 
         net += article_score
@@ -259,6 +279,8 @@ def _score_by_keywords(entries: list):
             "score":   round(article_score, 2),
             "pos":     list(pos_hits)[:3],
             "neg":     list(neg_hits)[:3],
+            "hawkish": hawkish_hits,
+            "dovish":  dovish_hits,
         })
 
     final = net / len(entries) if entries else 0.0
