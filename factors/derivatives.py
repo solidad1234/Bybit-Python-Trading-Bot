@@ -14,8 +14,15 @@ Score : -1.0 (longs crowded / SHORT setup) … +1.0 (shorts crowded / LONG setup
 
 import requests
 import numpy as np
+import time
 
 BYBIT_URL = "https://api.bybit.com/v5/market"
+_CACHE = {}
+_CACHE_TTLS = {
+    "funding_history": 1800,
+    "open_interest": 300,
+    "long_short_ratio": 1800,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -24,8 +31,9 @@ BYBIT_URL = "https://api.bybit.com/v5/market"
 
 def get_derivatives_score(symbol: str) -> dict:
     """Combine funding, OI trend, and L/S ratio into one derivatives score."""
+    ticker = _ticker(symbol)
     funding = _funding(symbol)
-    oi      = _open_interest(symbol)
+    oi      = _open_interest(symbol, ticker=ticker)
     ls      = _long_short_ratio(symbol)
 
     components = {}
@@ -65,25 +73,24 @@ def get_derivatives_score(symbol: str) -> dict:
 # Sub-signals
 # ---------------------------------------------------------------------------
 
-def _funding(symbol: str):
+def _funding(symbol: str, ticker=None):
     """
     Current + recent-average funding rate.
     High positive funding → longs overcrowded → SHORT bias (negative score).
     High negative funding → shorts overcrowded → LONG bias (positive score).
     """
     try:
-        # Current rate from ticker
-        r = requests.get(f"{BYBIT_URL}/tickers",
-                         params={"category": "linear", "symbol": symbol}, timeout=8)
-        d = r.json()
-        if d.get("retCode") != 0:
+        current_rate = ticker.get("fundingRate") if ticker else None
+        if current_rate is None:
             return None
-        current_rate = float(d["result"]["list"][0].get("fundingRate", 0))
+        current_rate = float(current_rate)
 
         # 8-period history (~2.67 days at 8-hour intervals)
-        h = requests.get(f"{BYBIT_URL}/funding/history",
-                         params={"category": "linear", "symbol": symbol, "limit": 8}, timeout=8)
-        hd = h.json()
+        hd = _cached_json(
+            "funding_history", symbol,
+            f"{BYBIT_URL}/funding/history",
+            {"category": "linear", "symbol": symbol, "limit": 8},
+        )
         avg_rate = current_rate
         if hd.get("retCode") == 0:
             rates = [float(x["fundingRate"]) for x in hd["result"]["list"]]
@@ -109,7 +116,7 @@ def _funding(symbol: str):
         return None
 
 
-def _open_interest(symbol: str):
+def _open_interest(symbol: str, ticker=None):
     """
     OI trend over ~16 hours (4 × 4h bars).
     Rising OI + rising price  → longs building → LONG bias
@@ -117,10 +124,12 @@ def _open_interest(symbol: str):
     Falling OI                → deleveraging → neutral
     """
     try:
-        r = requests.get(f"{BYBIT_URL}/open-interest",
-                         params={"category": "linear", "symbol": symbol,
-                                 "intervalTime": "4h", "limit": 8}, timeout=8)
-        d = r.json()
+        d = _cached_json(
+            "open_interest", symbol,
+            f"{BYBIT_URL}/open-interest",
+            {"category": "linear", "symbol": symbol,
+             "intervalTime": "4h", "limit": 8},
+        )
         if d.get("retCode") != 0:
             return None
 
@@ -135,13 +144,9 @@ def _open_interest(symbol: str):
         if abs(oi_chg) < 0.02:  # < 2% OI change → noise
             return {"score": 0.0, "oi_change_pct": round(oi_chg * 100, 2)}
 
-        # Get 24h price change from ticker
-        t = requests.get(f"{BYBIT_URL}/tickers",
-                         params={"category": "linear", "symbol": symbol}, timeout=8)
-        td = t.json()
         price_chg = 0.0
-        if td.get("retCode") == 0:
-            price_chg = float(td["result"]["list"][0].get("price24hPcnt", 0))
+        if ticker:
+            price_chg = float(ticker.get("price24hPcnt", 0))
 
         if oi_chg > 0 and price_chg > 0:
             score = min(1.0, oi_chg * 5)     # rising OI + rising price = LONG
@@ -166,10 +171,12 @@ def _long_short_ratio(symbol: str):
     <30% long  → crowded short → LONG bias
     """
     try:
-        r = requests.get(f"{BYBIT_URL}/account-ratio",
-                         params={"category": "linear", "symbol": symbol,
-                                 "period": "1h", "limit": 4}, timeout=8)
-        d = r.json()
+        d = _cached_json(
+            "long_short_ratio", symbol,
+            f"{BYBIT_URL}/account-ratio",
+            {"category": "linear", "symbol": symbol,
+             "period": "1h", "limit": 4},
+        )
         if d.get("retCode") != 0:
             return None
 
@@ -195,3 +202,31 @@ def _long_short_ratio(symbol: str):
 def _neutral(reason=""):
     return {"score": 0.0, "confidence": 0.0, "block_trade": False,
             "details": {"reason": reason}}
+
+
+def _ticker(symbol: str):
+    try:
+        response = requests.get(
+            f"{BYBIT_URL}/tickers",
+            params={"category": "linear", "symbol": symbol},
+            timeout=8,
+        ).json()
+        if response.get("retCode") != 0:
+            return None
+        items = response.get("result", {}).get("list", [])
+        return items[0] if items else None
+    except Exception:
+        return None
+
+
+def _cached_json(cache_name: str, symbol: str, url: str, params: dict):
+    key = (cache_name, symbol)
+    now = time.monotonic()
+    cached = _CACHE.get(key)
+    if cached and now - cached[0] < _CACHE_TTLS[cache_name]:
+        return cached[1]
+
+    response = requests.get(url, params=params, timeout=8).json()
+    if response.get("retCode") == 0:
+        _CACHE[key] = (now, response)
+    return response

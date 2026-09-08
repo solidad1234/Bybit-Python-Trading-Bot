@@ -799,20 +799,24 @@ class FuturesTradingBot:
         
         return indicators, current_price, volatility
 
-    def check_btc_correlation(self):
-        """Check Bitcoin trend correlation"""
+    def check_btc_correlation(self, data=None):
+        """Check Bitcoin trend correlation using supplied or fetched data."""
         try:
-            result = session.get_kline(
-                category="linear",
-                symbol="BTCUSDT",
-                interval="60",
-                limit=10
-            )
-            if result.get("retCode") == 0:
-                candles = result["result"]["list"]
-                candles = list(reversed(candles))
-                
+            if data and higher_timeframe in data:
+                btc_closes = data[higher_timeframe]['close']
+            else:
+                result = session.get_kline(
+                    category="linear",
+                    symbol="BTCUSDT",
+                    interval="60",
+                    limit=10
+                )
+                if result.get("retCode") != 0:
+                    return {'bullish': True, 'bearish': False, '1h_change': 0, '4h_change': 0}
+                candles = list(reversed(result["result"]["list"]))
                 btc_closes = [float(c[4]) for c in candles]
+
+            if len(btc_closes) >= 2:
                 btc_current = btc_closes[-1]
                 btc_1h_ago = btc_closes[-2] if len(btc_closes) > 1 else btc_current
                 btc_4h_ago = btc_closes[-5] if len(btc_closes) > 4 else btc_current
@@ -1601,8 +1605,10 @@ class FuturesTradingBot:
 
         print(f"🔍 Scanning Universe: {', '.join(TRADE_SYMBOLS)}")
 
-        # ── Pre-loop: fetch market-wide signals ONCE (avoids 5× redundant API calls) ──
-        btc_data = self.check_btc_correlation()
+        # ── Pre-loop: fetch market-wide signals ONCE ───────────────────────
+        # Reuse BTC's full scan data for correlation and the BTC symbol below.
+        btc_market_data = self.fetch_multi_timeframe_data("BTCUSDT")
+        btc_data = self.check_btc_correlation(btc_market_data)
         try:
             regime_info = get_regime_score()
         except Exception:
@@ -1616,7 +1622,8 @@ class FuturesTradingBot:
         for current_sym in TRADE_SYMBOLS:
             print(f"\n📊 Analyzing {current_sym}...")
 
-            data = self.fetch_multi_timeframe_data(current_sym)
+            data = (btc_market_data if current_sym == "BTCUSDT"
+                    else self.fetch_multi_timeframe_data(current_sym))
             if not data:
                 print(f"   ❌ Failed to fetch data")
                 continue
