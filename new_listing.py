@@ -77,7 +77,9 @@ class ListingWatcher:
     def discover(self):
         now_ms = int(time.time() * 1000)
         lookahead_ms = self.lookahead_minutes * 60 * 1000
-        linear = list(self._instrument_pages("linear", "PreLaunch"))
+        # Fetch all linear instruments so contracts that appear directly as
+        # Trading are not missed after leaving PreLaunch.
+        linear = list(self._instrument_pages("linear"))
         spot = list(self._instrument_pages("spot"))
 
         known_linear = set(self.state.get("linear_symbols", []))
@@ -85,11 +87,13 @@ class ListingWatcher:
         current_linear = {item["symbol"] for item in linear}
         current_spot = {item["symbol"] for item in spot}
 
-        # The first run establishes a baseline instead of treating every existing
-        # Bybit symbol as a new listing.
-        new_linear = [] if known_linear else []
-        new_spot = [] if known_spot else []
-        if known_linear:
+        # Older state files only contained PreLaunch contracts. Migrate once by
+        # establishing a complete linear baseline instead of emitting hundreds
+        # of false new-listing events.
+        baseline_initialized = self.state.get("linear_baseline_initialized", False)
+        new_linear = []
+        new_spot = []
+        if baseline_initialized:
             new_linear = [item for item in linear if item["symbol"] not in known_linear]
         if known_spot:
             new_spot = [item for item in spot
@@ -98,11 +102,13 @@ class ListingWatcher:
         upcoming = []
         for item in linear:
             launch_ms = int(item.get("launchTime") or 0)
-            if launch_ms and now_ms <= launch_ms <= now_ms + lookahead_ms:
+            if (item.get("status") == "PreLaunch" and launch_ms
+                    and now_ms <= launch_ms <= now_ms + lookahead_ms):
                 upcoming.append(item)
 
         self.state["linear_symbols"] = sorted(current_linear)
         self.state["spot_symbols"] = sorted(current_spot)
+        self.state["linear_baseline_initialized"] = True
         self._save_state()
         return new_linear, new_spot, upcoming
 
@@ -217,16 +223,40 @@ class ListingWatcher:
             not item.get("isPreListing", False) or phase == "ContinuousTrading"
         )
         metadata = {
+            "product_type": ("spot" if category == "spot"
+                             else self._product_type(item)),
+            "full_name": item.get("fullName"),
+            "base_coin": item.get("baseCoin"),
+            "quote_coin": item.get("quoteCoin"),
+            "market_region": item.get("marketRegion"),
+            "underlying_ticker": item.get("underlyingTicker"),
+            "contract_type": item.get("contractType"),
             "status": status,
             "is_pre_listing": item.get("isPreListing"),
             "auction_phase": phase,
             "tradable": tradable,
+            "max_leverage": (item.get("leverageFilter") or {}).get("maxLeverage"),
+            "min_order_qty": (item.get("lotSizeFilter") or {}).get("minOrderQty"),
+            "qty_step": (item.get("lotSizeFilter") or {}).get("qtyStep"),
+            "max_market_qty": (item.get("lotSizeFilter") or {}).get("maxMktOrderQty"),
+            "min_notional_value": (item.get("lotSizeFilter") or {}).get("minNotionalValue"),
+            "tick_size": (item.get("priceFilter") or {}).get("tickSize"),
             "monitoring_started_utc": datetime.now(timezone.utc).isoformat(),
             "monitoring_until_epoch": time.time() + self.reaction_minutes * 60,
             "monitoring_minutes": self.reaction_minutes,
         }
         self.record_reaction(category, item["symbol"], item.get("launchTime"), metadata)
         self._save_state()
+
+    @staticmethod
+    def _product_type(item):
+        """Separate crypto listings from stock/other linear products."""
+        base_coin = (item.get("baseCoin") or "").upper()
+        region = (item.get("marketRegion") or "").upper()
+        underlying = item.get("underlyingTicker")
+        if base_coin.endswith("STOCK") or (region and underlying):
+            return "stock_linear"
+        return "crypto_linear"
 
 
 def parse_args():
