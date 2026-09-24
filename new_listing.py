@@ -132,10 +132,62 @@ class ListingWatcher:
             "ask_depth": round(sum(float(row[1]) * float(row[0]) for row in asks), 4),
         }
 
+    def _recent_trade_summary(self, category, symbol):
+        """Summarize the latest public executions without storing every fill."""
+        result = self._get(
+            "recent-trade",
+            {"category": category, "symbol": symbol,
+             "limit": 60 if category == "spot" else 100},
+        )
+        trades = result.get("list", [])
+        if not trades:
+            return {
+                "recent_trade_count": 0,
+                "recent_buy_volume": 0.0,
+                "recent_sell_volume": 0.0,
+                "recent_buy_notional": 0.0,
+                "recent_sell_notional": 0.0,
+                "recent_vwap": None,
+                "last_trade_time": None,
+                "largest_trade_notional": 0.0,
+            }
+
+        buy_volume = sell_volume = 0.0
+        buy_notional = sell_notional = total_notional = total_volume = 0.0
+        largest_notional = 0.0
+        last_trade_time = None
+        for trade in trades:
+            price = float(trade.get("price") or 0)
+            size = float(trade.get("size") or 0)
+            notional = price * size
+            side = str(trade.get("side", "")).lower()
+            total_volume += size
+            total_notional += notional
+            largest_notional = max(largest_notional, notional)
+            last_trade_time = max(last_trade_time or "", str(trade.get("time", "")))
+            if side == "buy":
+                buy_volume += size
+                buy_notional += notional
+            elif side == "sell":
+                sell_volume += size
+                sell_notional += notional
+
+        return {
+            "recent_trade_count": len(trades),
+            "recent_buy_volume": round(buy_volume, 8),
+            "recent_sell_volume": round(sell_volume, 8),
+            "recent_buy_notional": round(buy_notional, 4),
+            "recent_sell_notional": round(sell_notional, 4),
+            "recent_vwap": round(total_notional / total_volume, 8) if total_volume else None,
+            "last_trade_time": last_trade_time,
+            "largest_trade_notional": round(largest_notional, 4),
+        }
+
     def record_reaction(self, category, symbol, launch_time=None, metadata=None):
         try:
             ticker = self._ticker(category, symbol)
             book = self._orderbook(category, symbol)
+            trades = self._recent_trade_summary(category, symbol)
         except Exception as exc:
             print(f"  reaction unavailable for {symbol}: {exc}")
             return
@@ -161,14 +213,16 @@ class ListingWatcher:
             "bid_price": ticker.get("bid1Price"),
             "ask_price": ticker.get("ask1Price"),
             **book,
+            **trades,
         }
         event["last_sample_epoch"] = time.time()
         event["samples"].append(sample)
         self._append_log({"symbol": symbol, **event, "latest": sample})
         print(
             f"  {symbol}: price={last_price:g} spread={book['spread_bps']}bps "
-            f"volume24h={ticker.get('volume24h', '?')} "
-            f"OI={ticker.get('openInterest', '?')}"
+            f"trades={trades['recent_trade_count']} "
+            f"flow_buy={trades['recent_buy_notional']:.2f} "
+            f"flow_sell={trades['recent_sell_notional']:.2f}"
         )
 
     def _sample_active_events(self):
